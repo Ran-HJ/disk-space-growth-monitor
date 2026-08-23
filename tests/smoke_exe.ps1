@@ -1,6 +1,6 @@
 param(
     [string]$ExePath = "",
-    [ValidateSet("quick", "full")]
+    [ValidateSet("quick", "full", "low")]
     [string]$CloseBehavior = "quick"
 )
 
@@ -48,7 +48,9 @@ $env:DISK_GROWTH_MONITOR_INSTANCE_NAME = (
 )
 
 try {
-    & $pythonPath -c "from disk_monitor.storage import Storage; Storage().set_setting('close_behavior', '$CloseBehavior')"
+    $runMode = if ($CloseBehavior -eq "low") { "low_memory" } else { "full" }
+    $storedCloseBehavior = if ($CloseBehavior -eq "low") { "ask" } else { $CloseBehavior }
+    & $pythonPath -c "from disk_monitor.storage import Storage; s=Storage(); s.set_setting('close_behavior', '$storedCloseBehavior'); s.set_setting('run_mode', '$runMode')"
 
     $launcher = Start-Process `
         -FilePath $exePath `
@@ -73,9 +75,31 @@ try {
         throw "EXE 未在 15 秒内创建主窗口。"
     }
 
-    $baselineReady = $false
-    $baselineDeadline = (Get-Date).AddSeconds(30)
-    while ((Get-Date) -lt $baselineDeadline) {
+    if ($CloseBehavior -eq "low") {
+        $lowReady = $false
+        $lowDeadline = (Get-Date).AddSeconds(15)
+        while ((Get-Date) -lt $lowDeadline) {
+            $lowState = & $pythonPath -c "import sqlite3; from disk_monitor.storage import default_database_path; c=sqlite3.connect(default_database_path()); active=c.execute(`"select count(*), sum(case when start_snapshot_id is not null then 1 else 0 end) from monitor_sessions where status='active'`" ).fetchone(); snapshots=c.execute('select count(*) from snapshots').fetchone()[0]; print(f'{active[0]}:{active[1] or 0}:{snapshots}'); c.close()"
+            $hasLowLog = (
+                (Test-Path -LiteralPath $logPath) -and
+                (Select-String `
+                    -LiteralPath $logPath `
+                    -Pattern "low_memory_session_started" `
+                    -Quiet)
+            )
+            if ($lowState -eq "1:0:0" -and $hasLowLog) {
+                $lowReady = $true
+                break
+            }
+            Start-Sleep -Milliseconds 200
+        }
+        if (-not $lowReady) {
+            throw "EXE 低内存冷启动状态不正确：$lowState"
+        }
+    } else {
+        $baselineReady = $false
+        $baselineDeadline = (Get-Date).AddSeconds(30)
+        while ((Get-Date) -lt $baselineDeadline) {
         $baselineState = & $pythonPath -c "import sqlite3; from disk_monitor.storage import default_database_path; c=sqlite3.connect(default_database_path()); row=c.execute(`"select count(*), sum(case when start_snapshot_id is not null then 1 else 0 end) from monitor_sessions where status='active'`" ).fetchone(); print(f'{row[0]}:{row[1] or 0}'); c.close()"
         $hasBaselineLog = Test-Path -LiteralPath $logPath
         $hasTreemapLog = $false
@@ -99,14 +123,15 @@ try {
             break
         }
         Start-Sleep -Milliseconds 200
-    }
-    if (-not $baselineReady) {
-        $logTail = if (Test-Path -LiteralPath $logPath) {
-            (Get-Content -LiteralPath $logPath -Tail 20) -join [Environment]::NewLine
-        } else {
-            "ui.log 不存在"
         }
-        throw "EXE 未在 30 秒内完成启动基线和非空矩形图。状态：$baselineState`n$logTail"
+        if (-not $baselineReady) {
+            $logTail = if (Test-Path -LiteralPath $logPath) {
+                (Get-Content -LiteralPath $logPath -Tail 20) -join [Environment]::NewLine
+            } else {
+                "ui.log 不存在"
+            }
+            throw "EXE 未在 30 秒内完成启动基线和非空矩形图。状态：$baselineState`n$logTail"
+        }
     }
 
     if (-not $windowProcess.CloseMainWindow()) {
@@ -130,6 +155,8 @@ try {
     $sessionStatus = & $pythonPath -c "from disk_monitor.storage import Storage; s=Storage().latest_completed_session(); print(f'{s.status}:{s.end_reason}' if s else 'missing')"
     $expectedStatus = if ($CloseBehavior -eq "full") {
         "completed:normal_close"
+    } elseif ($CloseBehavior -eq "low") {
+        "completed:low_memory_close"
     } else {
         "completed:quick_close"
     }
@@ -149,13 +176,23 @@ try {
         if (-not $hasClosingLog) {
             throw "完整关闭缺少 closing 扫描收尾日志。"
         }
+    } elseif ($CloseBehavior -eq "low") {
+        $snapshotState = & $pythonPath -c "from disk_monitor.storage import Storage; s=Storage(); session=s.latest_completed_session(); print(f'{session.start_snapshot_id or 0}:{session.end_snapshot_id or 0}:{len(s.list_snapshots(limit=10))}')"
+        if ($snapshotState -ne "0:0:0") {
+            throw "低内存关闭不应创建地址快照：$snapshotState"
+        }
     }
-    Write-Host "EXE 启动基线、非空矩形图与 $CloseBehavior 关闭冒烟测试通过。"
+    if ($CloseBehavior -eq "low") {
+        Write-Host "EXE 低内存冷启动、无地址快照与 low_memory_close 冒烟测试通过。"
+    } else {
+        Write-Host "EXE 启动基线、非空矩形图与 $CloseBehavior 关闭冒烟测试通过。"
+    }
 }
 finally {
     Get-Process -ErrorAction SilentlyContinue |
         Where-Object { $_.Path -eq $exePath } |
         Stop-Process -Force
+    Start-Sleep -Milliseconds 300
     $env:LOCALAPPDATA = $previousLocalAppData
     $env:DISK_GROWTH_MONITOR_INITIAL_PATH = $previousInitialPath
     $env:DISK_GROWTH_MONITOR_INSTANCE_NAME = $previousInstanceName
@@ -164,6 +201,10 @@ finally {
         $resolvedSmokeRoot.StartsWith($tempBase) -and
         (Split-Path -Leaf $resolvedSmokeRoot).StartsWith("DiskMonitorExeSmoke-")
     ) {
-        Remove-Item -LiteralPath $resolvedSmokeRoot -Recurse -Force
+        Remove-Item `
+            -LiteralPath $resolvedSmokeRoot `
+            -Recurse `
+            -Force `
+            -ErrorAction SilentlyContinue
     }
 }

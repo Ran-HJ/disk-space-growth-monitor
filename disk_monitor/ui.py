@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import gc
 import logging
 import os
 import queue
@@ -78,6 +79,13 @@ SNAPSHOT_SOURCE_LABELS = {
 BASELINE_MODE_LABELS = {
     "startup": "本次启动快照",
     "latest_full": "最近完整保存",
+}
+
+RUN_MODE_FULL = "full"
+RUN_MODE_LOW_MEMORY = "low_memory"
+RUN_MODE_LABELS = {
+    RUN_MODE_FULL: "全功能模式",
+    RUN_MODE_LOW_MEMORY: "低内存模式",
 }
 
 
@@ -163,6 +171,14 @@ class DiskMonitorApp:
     ) -> None:
         self.root = root
         self.storage = storage or Storage()
+        stored_run_mode = self.storage.get_setting("run_mode", RUN_MODE_FULL)
+        self.run_mode = (
+            stored_run_mode
+            if stored_run_mode in RUN_MODE_LABELS
+            else RUN_MODE_FULL
+        )
+        if stored_run_mode not in RUN_MODE_LABELS:
+            self.storage.set_setting("run_mode", self.run_mode)
         self.log_path = Path(log_path or self.storage.database_path.parent / "ui.log")
         self.logger = logging.getLogger(f"disk_monitor.ui.{id(self)}")
         self.logger.setLevel(logging.INFO)
@@ -223,6 +239,18 @@ class DiskMonitorApp:
         self.latest_full_snapshot_id: int | None = None
         self.manual_baseline_mode: str | None = None
         self.blind_spot_result: BlindSpotResult | None = None
+        self.low_memory_origin: str | None = None
+        self.low_memory_started_at: datetime | None = None
+        self.low_memory_start_sample: DiskSample | None = None
+        self.low_memory_reference_snapshot_id: int | None = None
+        self.low_memory_reference_finished_at: datetime | None = None
+        self.cold_low_memory_baseline_pending = False
+        self.test_low_after_baseline = (
+            os.environ.get("DISK_GROWTH_MONITOR_TEST_LOW_AFTER_BASELINE") == "1"
+            and os.environ.get("DISK_GROWTH_MONITOR_INSTANCE_NAME", "").startswith(
+                "Local\\DiskGrowthMonitorMemory-"
+            )
+        )
         self.history_cursor: tuple | None = None
         self.history_loaded = False
         self.history_items_by_id: dict[str, SnapshotInfo] = {}
@@ -238,6 +266,8 @@ class DiskMonitorApp:
 
         self.path_var = tk.StringVar(value=requested_path)
         self.status_var = tk.StringVar(value="准备就绪")
+        self.mode_status_var = tk.StringVar(value=RUN_MODE_LABELS[self.run_mode])
+        self.mode_button_var = tk.StringVar(value="切换低内存模式")
         self.total_var = tk.StringVar(value="--")
         self.used_var = tk.StringVar(value="--")
         self.free_var = tk.StringVar(value="--")
@@ -253,6 +283,7 @@ class DiskMonitorApp:
         self.snapshot_total_var = tk.StringVar(value="--")
         self.runtime_change_var = tk.StringVar(value="等待首次磁盘采样")
         self.blind_spot_var = tk.StringVar(value="等待首次磁盘采样")
+        self.low_memory_change_var = tk.StringVar(value="尚未进入低内存模式")
         self.history_status_var = tk.StringVar(value="请选择两条同路径快照进行对比")
         self.trend_range_var = tk.StringVar(value="24 小时")
         self.trend_title_var = tk.StringVar(value="最近 24 小时已用空间")
@@ -262,14 +293,19 @@ class DiskMonitorApp:
             value="基线：正在建立 · 扫描：尚无数据 · 盲区：等待采样"
         )
         self.last_scan_summary = "尚无数据"
+        self.treemap_placeholder_text = "点击“重新扫描当前目录”生成空间分布图"
 
         self._configure_window()
         self._configure_styles()
         self._build_ui()
+        self._apply_run_mode_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         atexit.register(self._finalize_on_process_exit)
         self.logger.info(
-            "app_started version=%s initial_path=%s", __version__, requested_path
+            "app_started version=%s initial_path=%s run_mode=%s",
+            __version__,
+            requested_path,
+            self.run_mode,
         )
         self.poll_after_id = self.root.after(100, self._poll_messages)
         self.sample_after_id = self.root.after(200, self._sample_now)
@@ -366,6 +402,17 @@ class DiskMonitorApp:
             text="持续记录 · 快照对比 · 增长溯源",
             style="Subtitle.TLabel",
         ).pack(side=tk.LEFT, padx=(14, 0), pady=(8, 0))
+        self.mode_toggle_button = ttk.Button(
+            title_row,
+            textvariable=self.mode_button_var,
+            command=self._toggle_run_mode,
+        )
+        self.mode_toggle_button.pack(side=tk.RIGHT)
+        ttk.Label(
+            title_row,
+            textvariable=self.mode_status_var,
+            style="Subtitle.TLabel",
+        ).pack(side=tk.RIGHT, padx=(0, 10), pady=(4, 0))
 
         metrics = ttk.Frame(outer)
         metrics.pack(fill=tk.X, pady=(16, 12))
@@ -414,7 +461,10 @@ class DiskMonitorApp:
         )
         self.path_entry = ttk.Entry(controls, textvariable=self.path_var)
         self.path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 8))
-        ttk.Button(controls, text="选择目录", command=self._choose_directory).pack(
+        self.choose_directory_button = ttk.Button(
+            controls, text="选择目录", command=self._choose_directory
+        )
+        self.choose_directory_button.pack(
             side=tk.LEFT, padx=(0, 8)
         )
         self.scan_button = ttk.Button(
@@ -432,7 +482,10 @@ class DiskMonitorApp:
             controls, text="保存快照", command=self._save_marked_snapshot
         )
         self.save_snapshot_button.pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(controls, text="设置", command=self._open_settings).pack(
+        self.settings_button = ttk.Button(
+            controls, text="设置", command=self._open_settings
+        )
+        self.settings_button.pack(
             side=tk.LEFT, padx=(8, 0)
         )
 
@@ -524,20 +577,23 @@ class DiskMonitorApp:
             foreground=COLORS["text"],
             font=("Microsoft YaHei UI", 11, "bold"),
         ).pack(side=tk.LEFT)
-        view_switch = ttk.Combobox(
+        self.change_view_selector = ttk.Combobox(
             growth_header,
             textvariable=self.change_view_var,
             values=("增长", "减少"),
             state="readonly",
             width=6,
         )
-        view_switch.pack(side=tk.RIGHT)
-        view_switch.bind("<<ComboboxSelected>>", self._refresh_change_view)
-        ttk.Button(
+        self.change_view_selector.pack(side=tk.RIGHT)
+        self.change_view_selector.bind(
+            "<<ComboboxSelected>>", self._refresh_change_view
+        )
+        self.restore_baseline_button = ttk.Button(
             growth_header,
             text="恢复默认基线",
             command=self._restore_default_baseline,
-        ).pack(side=tk.RIGHT, padx=(0, 8))
+        )
+        self.restore_baseline_button.pack(side=tk.RIGHT, padx=(0, 8))
         self.baseline_mode_selector = ttk.Combobox(
             growth_header,
             textvariable=self.baseline_mode_var,
@@ -619,6 +675,23 @@ class DiskMonitorApp:
             wraplength=570,
         )
         self.blind_spot_label.grid(row=2, column=1, sticky=tk.EW, pady=3)
+
+        ttk.Label(
+            change_summary,
+            text="本次启动后的低内存期间变化（磁盘已用容量）",
+            style="MetricName.TLabel",
+        ).grid(row=3, column=0, sticky=tk.W, padx=(0, 14), pady=3)
+        self.low_memory_change_label = tk.Label(
+            change_summary,
+            textvariable=self.low_memory_change_var,
+            bg=COLORS["panel"],
+            fg=COLORS["muted"],
+            font=("Microsoft YaHei UI", 10, "bold"),
+            anchor=tk.W,
+            justify=tk.LEFT,
+            wraplength=570,
+        )
+        self.low_memory_change_label.grid(row=3, column=1, sticky=tk.EW, pady=3)
         change_summary.grid_columnconfigure(1, weight=1)
 
         ttk.Label(
@@ -743,6 +816,9 @@ class DiskMonitorApp:
         self.notebook.pack(fill=tk.BOTH, expand=True)
 
     def _choose_directory(self) -> None:
+        if self.run_mode == RUN_MODE_LOW_MEMORY:
+            self.status_var.set("低内存模式不执行目录扫描")
+            return
         selected = filedialog.askdirectory(
             title="选择要扫描的目录", initialdir=self.path_var.get()
         )
@@ -779,6 +855,9 @@ class DiskMonitorApp:
             return False
 
     def _refresh_current_path(self) -> None:
+        if self.run_mode == RUN_MODE_LOW_MEMORY:
+            self.status_var.set("低内存模式不执行目录扫描；请先切回全功能模式")
+            return
         path = self.path_var.get().strip()
         if not path:
             messagebox.showerror("无法扫描", "请输入一个存在的目录路径。")
@@ -790,6 +869,9 @@ class DiskMonitorApp:
         self._start_scan(role="manual", path=normalized)
 
     def _save_marked_snapshot(self) -> None:
+        if self.run_mode == RUN_MODE_LOW_MEMORY:
+            self.status_var.set("低内存模式不建立文件快照；请先切回全功能模式")
+            return
         if self.scan_thread and self.scan_thread.is_alive():
             messagebox.showinfo("扫描进行中", "请等待当前扫描结束后再保存快照。")
             return
@@ -822,6 +904,9 @@ class DiskMonitorApp:
         self._navigate_to(self.nav_stack[-1], update_stack=False)
 
     def _navigate_to(self, path: str, *, update_stack: bool = True) -> None:
+        if self.run_mode == RUN_MODE_LOW_MEMORY:
+            self.status_var.set("低内存模式不加载目录明细")
+            return
         if self.scan_thread and self.scan_thread.is_alive():
             self.status_var.set("请等待当前扫描结束后再切换目录")
             return
@@ -917,14 +1002,252 @@ class DiskMonitorApp:
                     side=tk.LEFT, padx=2
                 )
             label = path if index == 0 else os.path.basename(path)
-            ttk.Button(
+            button = ttk.Button(
                 self.breadcrumb_frame,
                 text=label or path,
                 command=lambda value=path: self._navigate_to(value),
-            ).pack(side=tk.LEFT)
+                state=(
+                    tk.DISABLED
+                    if self.run_mode == RUN_MODE_LOW_MEMORY
+                    else tk.NORMAL
+                ),
+            )
+            button.pack(side=tk.LEFT)
         self.up_button.configure(
-            state=tk.NORMAL if len(self.nav_stack) > 1 else tk.DISABLED
+            state=(
+                tk.NORMAL
+                if self.run_mode == RUN_MODE_FULL and len(self.nav_stack) > 1
+                else tk.DISABLED
+            )
         )
+
+    def _select_low_memory_reference(
+        self,
+    ) -> tuple[int | None, datetime | None]:
+        session_root = self._normalize_path(self.session_root_path)
+        for snapshot_id in (
+            self.automatic_current_snapshot_id,
+            self.session_start_snapshot_id,
+        ):
+            if snapshot_id is None:
+                continue
+            info = self.storage.get_snapshot_info(snapshot_id)
+            if (
+                info is not None
+                and self._normalize_path(info.root_path) == session_root
+            ):
+                return info.id, info.finished_at
+        return None, None
+
+    def _request_run_mode(self, requested_mode: str) -> bool:
+        if requested_mode not in RUN_MODE_LABELS:
+            raise ValueError(f"未知运行模式：{requested_mode}")
+        if requested_mode == self.run_mode:
+            return True
+        if self.session_id is None or self.session_start_sample is None:
+            messagebox.showinfo(
+                "正在初始化",
+                "请等待首次磁盘采样完成后再切换运行模式。",
+                parent=self.root,
+            )
+            return False
+        if requested_mode == RUN_MODE_LOW_MEMORY:
+            if self.active_scan_role is not None or (
+                self.scan_thread and self.scan_thread.is_alive()
+            ):
+                messagebox.showinfo(
+                    "扫描进行中",
+                    "请等待当前扫描结束，或先取消扫描，再切换低内存模式。",
+                    parent=self.root,
+                )
+                return False
+            self._enter_low_memory_mode()
+            return True
+        return self._leave_low_memory_mode()
+
+    def _toggle_run_mode(self) -> None:
+        requested_mode = (
+            RUN_MODE_LOW_MEMORY
+            if self.run_mode == RUN_MODE_FULL
+            else RUN_MODE_FULL
+        )
+        self._request_run_mode(requested_mode)
+
+    def _enter_low_memory_mode(self) -> None:
+        reference_id, reference_finished_at = self._select_low_memory_reference()
+        try:
+            sample = self._record_mode_boundary_sample()
+        except Exception as error:
+            self.logger.warning(
+                "low_memory_boundary_sample_failed error=%s", error
+            )
+            sample = self.latest_disk_sample or self.session_start_sample
+        if sample is None:
+            raise RuntimeError("尚未取得磁盘采样，无法切换低内存模式")
+
+        if self.baseline_after_id is not None:
+            try:
+                self.root.after_cancel(self.baseline_after_id)
+            except tk.TclError:
+                pass
+            self.baseline_after_id = None
+        self.baseline_pending = False
+        self.low_memory_origin = "full"
+        self.low_memory_started_at = sample.recorded_at
+        self.low_memory_start_sample = sample
+        self.low_memory_reference_snapshot_id = reference_id
+        self.low_memory_reference_finished_at = reference_finished_at
+        self.run_mode = RUN_MODE_LOW_MEMORY
+        self.storage.set_setting("run_mode", self.run_mode)
+        self._release_full_mode_state()
+        self._apply_run_mode_ui()
+        self._update_low_memory_change(sample)
+        gc.collect()
+        gc.collect()
+        self.logger.info(
+            "run_mode_changed mode=low_memory reference_snapshot_id=%s",
+            reference_id,
+        )
+
+    def _leave_low_memory_mode(self) -> bool:
+        cold_start = self.low_memory_origin == "cold"
+        should_scan = True
+        if cold_start:
+            messagebox.showinfo(
+                "建立文件基线",
+                "此前只有磁盘口径记录，无文件地址明细；本次建立新基线。",
+                parent=self.root,
+            )
+        else:
+            answer = messagebox.askyesnocancel(
+                "切回全功能模式",
+                "是否立即扫描当前监控路径并重建空间分布？\n\n"
+                "是：立即补扫；否：只切换模式，稍后手动扫描；取消：保持低内存模式。",
+                parent=self.root,
+            )
+            if answer is None:
+                return False
+            should_scan = bool(answer)
+
+        reference_id = self.low_memory_reference_snapshot_id
+        try:
+            self._record_mode_boundary_sample()
+        except Exception as error:
+            self.logger.warning(
+                "full_mode_boundary_sample_failed error=%s", error
+            )
+        self.run_mode = RUN_MODE_FULL
+        self.storage.set_setting("run_mode", self.run_mode)
+        self.treemap_placeholder_text = (
+            "数据尚未重建，点击“重新扫描当前目录”生成空间分布图"
+        )
+        self._apply_run_mode_ui()
+        self._show_no_realtime_snapshot(
+            "全功能模式已恢复，尚无实时快照对比"
+        )
+        if should_scan:
+            if cold_start:
+                self.cold_low_memory_baseline_pending = True
+                self._start_scan(role="baseline", path=self.session_root_path)
+            else:
+                self._start_scan(
+                    role="low_memory_resume",
+                    path=self.session_root_path,
+                    reference_snapshot_id=reference_id,
+                )
+        else:
+            self._draw_treemap(animate=False)
+            self.status_var.set(
+                "已切回全功能模式；目录数据尚未重建，可稍后手动扫描"
+            )
+        self.logger.info(
+            "run_mode_changed mode=full rescan=%s reference_snapshot_id=%s",
+            should_scan,
+            reference_id,
+        )
+        return True
+
+    def _record_mode_boundary_sample(self) -> DiskSample:
+        sample = read_disk_sample(self.session_root_path)
+        self.storage.add_disk_sample(sample)
+        self.current_drive = sample.drive
+        self._reload_trend_data()
+        self._update_metrics(sample)
+        return sample
+
+    def _release_full_mode_state(self) -> None:
+        self._cancel_treemap_animation()
+        if self.treemap_resize_after_id is not None:
+            try:
+                self.root.after_cancel(self.treemap_resize_after_id)
+            except tk.TclError:
+                pass
+            self.treemap_resize_after_id = None
+        self.current_result = None
+        self.navigation_skeleton = None
+        self.nav_cache.clear()
+        self.nav_invalidated_roots.clear()
+        self.rectangle_items.clear()
+        self.rectangle_canvas_ids.clear()
+        self.hovered_rectangle_path = None
+        self.map_canvas.delete("all")
+        self.change_context = None
+        self.default_change_context = None
+        self.default_growth_subtitle = ""
+        self.default_baseline_info = ""
+        self.growth_item_by_id.clear()
+        for item_id in self.growth_tree.get_children():
+            self.growth_tree.delete(item_id)
+        self.automatic_baseline_snapshot_id = None
+        self.automatic_current_snapshot_id = None
+        self.latest_full_snapshot_id = None
+        self.manual_baseline_mode = None
+        self.last_scan_summary = "低内存模式未扫描"
+
+    def _show_no_realtime_snapshot(self, subtitle: str) -> None:
+        self.change_context = None
+        self.snapshot_total_var.set("--")
+        self.snapshot_total_label.configure(fg=COLORS["muted"])
+        self.baseline_info_var.set("基线：未加载实时文件快照")
+        self.comparison_info_var.set("当前比较：无实时文件快照")
+        self.growth_subtitle_var.set(subtitle)
+        self.growth_item_by_id.clear()
+        for item_id in self.growth_tree.get_children():
+            self.growth_tree.delete(item_id)
+        self.growth_tree.insert("", tk.END, text=subtitle)
+
+    def _apply_run_mode_ui(self) -> None:
+        low_memory = self.run_mode == RUN_MODE_LOW_MEMORY
+        self.mode_status_var.set(RUN_MODE_LABELS[self.run_mode])
+        self.mode_button_var.set(
+            "切换全功能模式" if low_memory else "切换低内存模式"
+        )
+        control_state = tk.DISABLED if low_memory or self.closing else tk.NORMAL
+        self.mode_toggle_button.configure(
+            state=tk.DISABLED if self.closing else tk.NORMAL
+        )
+        self.scan_button.configure(state=control_state)
+        self.save_snapshot_button.configure(state=control_state)
+        self.choose_directory_button.configure(state=control_state)
+        self.path_entry.configure(state=control_state)
+        self.cancel_button.configure(state=tk.DISABLED)
+        self.restore_baseline_button.configure(
+            state=tk.DISABLED if low_memory else tk.NORMAL
+        )
+        if low_memory:
+            self.treemap_placeholder_text = (
+                "低内存模式：未扫描，切回全功能后可补扫"
+            )
+            self.detail_var.set(self.treemap_placeholder_text)
+            self._show_no_realtime_snapshot(
+                "低内存模式：无实时快照对比"
+            )
+            self.baseline_mode_var.set("低内存模式")
+            self.baseline_mode_selector.configure(state=tk.DISABLED)
+            self._draw_treemap(animate=False)
+            self.status_var.set("已切换低内存模式：持续记录容量与趋势")
+        self._refresh_breadcrumbs()
+        self._refresh_context_status()
 
     def _open_settings(self) -> None:
         window = tk.Toplevel(self.root)
@@ -953,20 +1276,35 @@ class DiskMonitorApp:
         )
         behavior_box.grid(row=1, column=0, sticky=tk.W)
 
+        ttk.Label(
+            body,
+            text="运行模式",
+            font=("Microsoft YaHei UI", 10, "bold"),
+        ).grid(row=2, column=0, sticky=tk.W, pady=(16, 6))
+        run_mode_var = tk.StringVar(value=RUN_MODE_LABELS[self.run_mode])
+        run_mode_box = ttk.Combobox(
+            body,
+            textvariable=run_mode_var,
+            values=tuple(RUN_MODE_LABELS.values()),
+            state="readonly",
+            width=24,
+        )
+        run_mode_box.grid(row=3, column=0, sticky=tk.W)
+
         autostart_var = tk.BooleanVar(value=is_autostart_enabled())
         ttk.Checkbutton(
             body,
             text="登录 Windows 后自动启动监控器",
             variable=autostart_var,
-        ).grid(row=2, column=0, sticky=tk.W, pady=(16, 4))
+        ).grid(row=4, column=0, sticky=tk.W, pady=(16, 4))
         ttk.Label(
             body,
             text="分钟采样保留 30 天，原始目录快照保留 90 天。",
             foreground=COLORS["muted"],
-        ).grid(row=3, column=0, sticky=tk.W, pady=(4, 16))
+        ).grid(row=5, column=0, sticky=tk.W, pady=(4, 16))
 
         buttons = ttk.Frame(body)
-        buttons.grid(row=4, column=0, sticky=tk.E)
+        buttons.grid(row=6, column=0, sticky=tk.E)
 
         def save_settings() -> None:
             behavior = next(
@@ -974,6 +1312,13 @@ class DiskMonitorApp:
                 for key, label in CLOSE_BEHAVIOR_LABELS.items()
                 if label == behavior_var.get()
             )
+            requested_mode = next(
+                key
+                for key, label in RUN_MODE_LABELS.items()
+                if label == run_mode_var.get()
+            )
+            if not self._request_run_mode(requested_mode):
+                return
             try:
                 self.storage.set_setting("close_behavior", behavior)
                 set_autostart(autostart_var.get())
@@ -1022,13 +1367,28 @@ class DiskMonitorApp:
                 self.session_id = self.storage.start_session(
                     sample, self.session_root_path
                 )
-                self.baseline_pending = True
-                self.baseline_after_id = self.root.after(
-                    300,
-                    lambda: self._start_scan(
-                        role="baseline", path=self.session_root_path
-                    ),
-                )
+                if self.run_mode == RUN_MODE_LOW_MEMORY:
+                    self.low_memory_origin = "cold"
+                    self.low_memory_started_at = sample.recorded_at
+                    self.low_memory_start_sample = sample
+                    self.low_memory_reference_snapshot_id = None
+                    self.low_memory_reference_finished_at = None
+                    self.baseline_pending = False
+                    self.status_var.set(
+                        "低内存模式已启动：持续记录磁盘趋势，不建立目录基线"
+                    )
+                    self.logger.info(
+                        "low_memory_session_started sample_at=%s",
+                        sample.recorded_at.isoformat(timespec="seconds"),
+                    )
+                else:
+                    self.baseline_pending = True
+                    self.baseline_after_id = self.root.after(
+                        300,
+                        lambda: self._start_scan(
+                            role="baseline", path=self.session_root_path
+                        ),
+                    )
                 if self.startup_path_was_invalid:
                     self.status_var.set("启动路径无效，已自动回退到 C:\\")
             self.storage.add_disk_sample(sample)
@@ -1068,6 +1428,27 @@ class DiskMonitorApp:
         else:
             self.change_var.set("建立基线")
         self._update_runtime_change(sample)
+        self._update_low_memory_change(sample)
+
+    def _update_low_memory_change(self, sample: DiskSample) -> None:
+        start_sample = self.low_memory_start_sample
+        if start_sample is None:
+            self.low_memory_change_var.set("尚未进入低内存模式")
+            self.low_memory_change_label.configure(fg=COLORS["muted"])
+            return
+        change = sample.used_bytes - start_sample.used_bytes
+        prefix = "+" if change > 0 else ""
+        self.low_memory_change_var.set(
+            f"{prefix}{format_bytes(change)} · "
+            f"{start_sample.recorded_at:%H:%M:%S} → {sample.recorded_at:%H:%M:%S} "
+            "· 仅磁盘口径，无文件地址明细"
+        )
+        color = (
+            COLORS["warning"]
+            if change > 0
+            else "#15803d" if change < 0 else COLORS["muted"]
+        )
+        self.low_memory_change_label.configure(fg=color)
 
     def _update_runtime_change(self, sample: DiskSample) -> None:
         if self.session_start_sample is None:
@@ -1145,7 +1526,16 @@ class DiskMonitorApp:
         )
         self._draw_trend()
 
-    def _start_scan(self, role: str = "manual", path: str | None = None) -> None:
+    def _start_scan(
+        self,
+        role: str = "manual",
+        path: str | None = None,
+        *,
+        reference_snapshot_id: int | None = None,
+    ) -> None:
+        if self.run_mode == RUN_MODE_LOW_MEMORY:
+            self.status_var.set("低内存模式不执行目录扫描")
+            return
         if self.closing and role != "closing":
             return
         if self.scan_thread and self.scan_thread.is_alive():
@@ -1186,16 +1576,22 @@ class DiskMonitorApp:
             "closing": "正在保存关闭快照，完成后程序会自动退出……",
             "navigation": "没有可用缓存，正在扫描该目录……",
             "manual_save": "正在建立带备注的手动快照……",
+            "low_memory_resume": "正在补扫当前路径并重建全功能数据……",
         }.get(role, "正在准备扫描……")
         self.status_var.set(status_text)
         self.scan_thread = threading.Thread(
             target=self._scan_worker,
-            args=(scan_path_value, role),
+            args=(scan_path_value, role, reference_snapshot_id),
             daemon=True,
         )
         self.scan_thread.start()
 
-    def _scan_worker(self, path: str, role: str) -> None:
+    def _scan_worker(
+        self,
+        path: str,
+        role: str,
+        reference_snapshot_id: int | None = None,
+    ) -> None:
         try:
             result = scan_path(
                 path,
@@ -1205,7 +1601,8 @@ class DiskMonitorApp:
                 ),
             )
             note = self.pending_scan_note if role == "manual_save" else None
-            self.storage.save_scan(result, note=note, source=role)
+            snapshot_source = "manual" if role == "low_memory_resume" else role
+            self.storage.save_scan(result, note=note, source=snapshot_source)
             if role == "baseline":
                 if self.session_id is not None and result.snapshot_id is not None:
                     self.storage.set_session_start_snapshot(
@@ -1241,6 +1638,28 @@ class DiskMonitorApp:
                     self.session_id, result.snapshot_id
                 )
                 self.session_start_snapshot_id = result.snapshot_id
+            if role == "low_memory_resume":
+                growth: list[GrowthItem] = []
+                if (
+                    reference_snapshot_id is not None
+                    and result.snapshot_id is not None
+                ):
+                    growth = self.storage.compare_snapshots(
+                        result.snapshot_id,
+                        reference_snapshot_id,
+                        limit=100,
+                    )
+                self.messages.put(
+                    (
+                        "scan_done",
+                        role,
+                        result,
+                        growth,
+                        reference_snapshot_id is not None,
+                        reference_snapshot_id,
+                    )
+                )
+                return
             previous_id = self.storage.previous_snapshot_id(result)
             growth: list[GrowthItem] = []
             if previous_id is not None and result.snapshot_id is not None:
@@ -1287,12 +1706,27 @@ class DiskMonitorApp:
                         self.history_loaded = False
                         if role == "baseline":
                             self.session_start_snapshot_id = result.snapshot_id
-                            self._apply_startup_baseline(result)
-                            self.status_var.set(
-                                "启动目录基线已建立，正在记录本次变化"
-                            )
+                            if self.cold_low_memory_baseline_pending:
+                                self.cold_low_memory_baseline_pending = False
+                                self._apply_cold_low_memory_baseline(result)
+                            else:
+                                self._apply_startup_baseline(result)
+                                self.status_var.set(
+                                    "启动目录基线已建立，正在记录本次变化"
+                                )
+                                if self.test_low_after_baseline:
+                                    self.test_low_after_baseline = False
+                                    self.root.after_idle(
+                                        lambda: self._request_run_mode(
+                                            RUN_MODE_LOW_MEMORY
+                                        )
+                                    )
                         elif role == "navigation":
                             self._show_navigation_result(result, "新扫描")
+                        elif role == "low_memory_resume":
+                            self._apply_low_memory_resume(
+                                result, growth, previous_id
+                            )
                         else:
                             self._update_change_context_after_scan(
                                 result, previous_id
@@ -1323,6 +1757,11 @@ class DiskMonitorApp:
                 elif kind == "scan_error":
                     role, error = message[1:]
                     self.status_var.set(f"扫描失败：{error}")
+                    if role == "baseline" and self.cold_low_memory_baseline_pending:
+                        self.cold_low_memory_baseline_pending = False
+                        self._show_no_realtime_snapshot(
+                            "补扫失败：仍无实时文件快照，可稍后重试"
+                        )
                     self._finish_scan_ui()
                     if self.closing:
                         self._finish_without_address_snapshot(
@@ -1359,6 +1798,7 @@ class DiskMonitorApp:
             self.baseline_pending
             and self.session_start_snapshot_id is None
             and not self.closing
+            and self.run_mode == RUN_MODE_FULL
         ):
             self.baseline_after_id = self.root.after(
                 200,
@@ -1381,12 +1821,20 @@ class DiskMonitorApp:
         self.progress.stop()
         self.active_scan_role = None
         self.pending_scan_note = None
-        self.scan_button.configure(state=tk.DISABLED if self.closing else tk.NORMAL)
+        controls_disabled = self.closing or self.run_mode == RUN_MODE_LOW_MEMORY
+        self.scan_button.configure(
+            state=tk.DISABLED if controls_disabled else tk.NORMAL
+        )
         self.save_snapshot_button.configure(
-            state=tk.DISABLED if self.closing else tk.NORMAL
+            state=tk.DISABLED if controls_disabled else tk.NORMAL
+        )
+        self.choose_directory_button.configure(
+            state=tk.DISABLED if controls_disabled else tk.NORMAL
         )
         self.cancel_button.configure(state=tk.DISABLED)
-        self.path_entry.configure(state=tk.DISABLED if self.closing else tk.NORMAL)
+        self.path_entry.configure(
+            state=tk.DISABLED if controls_disabled else tk.NORMAL
+        )
         if not self.closing:
             self._refresh_breadcrumbs()
 
@@ -1575,6 +2023,83 @@ class DiskMonitorApp:
         )
         self._show_scan_result(result, [], False, update_growth=False)
 
+    def _apply_cold_low_memory_baseline(self, result: ScanResult) -> None:
+        if result.snapshot_id is None:
+            self._show_no_realtime_snapshot("本次补扫未能保存文件基线")
+            return
+        self.automatic_current_snapshot_id = result.snapshot_id
+        self.automatic_baseline_snapshot_id = result.snapshot_id
+        latest_full = self.storage.latest_full_snapshot_for_path(result.root_path)
+        self.latest_full_snapshot_id = latest_full.id if latest_full else None
+        self.manual_baseline_mode = None
+        self._configure_baseline_selector()
+        context = (
+            "snapshots",
+            result.snapshot_id,
+            result.snapshot_id,
+            result.root_path,
+        )
+        self._set_default_change_context(
+            context,
+            "此前只有磁盘口径记录，无文件地址明细；本次建立新基线",
+            "基线：切回全功能模式时新建",
+        )
+        self.low_memory_origin = None
+        self._show_scan_result(result, [], False, update_growth=False)
+        self.status_var.set("已切回全功能模式并建立新的文件基线")
+
+    def _apply_low_memory_resume(
+        self,
+        result: ScanResult,
+        growth: list[GrowthItem],
+        reference_snapshot_id: int | None,
+    ) -> None:
+        if result.snapshot_id is None:
+            self._show_no_realtime_snapshot("补扫未能保存文件快照")
+            return
+        self.automatic_current_snapshot_id = result.snapshot_id
+        latest_full = self.storage.latest_full_snapshot_for_path(result.root_path)
+        self.latest_full_snapshot_id = latest_full.id if latest_full else None
+        reference = (
+            self.storage.get_snapshot_info(reference_snapshot_id)
+            if reference_snapshot_id is not None
+            else None
+        )
+        self.manual_baseline_mode = None
+        if reference is None:
+            self.automatic_baseline_snapshot_id = result.snapshot_id
+            context = (
+                "snapshots",
+                result.snapshot_id,
+                result.snapshot_id,
+                result.root_path,
+            )
+            self._set_default_change_context(
+                context,
+                "此前无同路径快照，本次建立新基线",
+                "基线：本次补扫新建",
+            )
+            self._show_scan_result(result, [], False, update_growth=False)
+            self.status_var.set("补扫完成；此前无同路径快照，本次建立新基线")
+        else:
+            self.automatic_baseline_snapshot_id = reference.id
+            self._set_default_change_context(
+                (
+                    "snapshots",
+                    result.snapshot_id,
+                    reference.id,
+                    result.root_path,
+                ),
+                f"自参考快照（{reference.finished_at:%Y-%m-%d %H:%M}）以来的文件变化",
+                f"基线：低内存前参考快照（{reference.finished_at:%Y-%m-%d %H:%M}）",
+            )
+            self._show_scan_result(
+                result, growth, True, update_growth=False
+            )
+            self.status_var.set("补扫完成；文件变化按低内存前参考快照计算")
+        self._configure_baseline_selector()
+        self.low_memory_origin = None
+
     def _update_change_context_after_scan(
         self, result: ScanResult, previous_id: int | None
     ) -> None:
@@ -1627,6 +2152,12 @@ class DiskMonitorApp:
             )
 
     def _restore_default_baseline(self) -> None:
+        if self.run_mode == RUN_MODE_LOW_MEMORY:
+            self._show_no_realtime_snapshot(
+                "低内存模式：无实时快照对比"
+            )
+            self.status_var.set("低内存模式未加载实时文件快照")
+            return
         self.manual_baseline_mode = None
         self._configure_baseline_selector()
         self._set_change_context(
@@ -1744,6 +2275,7 @@ class DiskMonitorApp:
                     f"骨架估算 {memory_mb:.1f} MB"
                 )
         self.context_status_var.set(
+            f"模式：{RUN_MODE_LABELS[self.run_mode].replace('模式', '')} · "
             f"基线：{baseline} · 扫描：{self.last_scan_summary} · "
             f"导航骨架：{skeleton_text} · 盲区：{blind}"
         )
@@ -1859,7 +2391,11 @@ class DiskMonitorApp:
                 old_info.id,
                 new_info.root_path,
             ),
-            "指定历史快照的文件变化",
+            (
+                "历史快照对比，不代表本次低内存期间变化"
+                if self.run_mode == RUN_MODE_LOW_MEMORY
+                else "指定历史快照的文件变化"
+            ),
             f"基线：手动选择（{old_info.finished_at:%Y-%m-%d %H:%M}）",
         )
         self.manual_baseline_mode = None
@@ -2044,9 +2580,10 @@ class DiskMonitorApp:
             canvas.create_text(
                 width / 2,
                 height / 2,
-                text="点击“重新扫描当前目录”生成空间分布图",
+                text=self.treemap_placeholder_text,
                 fill=COLORS["muted"],
                 font=("Microsoft YaHei UI", 11),
+                width=max(width - 30, 20),
             )
             return
         target_rectangles: list[
@@ -2456,6 +2993,9 @@ class DiskMonitorApp:
             return
         if self.scan_thread and self.scan_thread.is_alive():
             return
+        if self.run_mode == RUN_MODE_LOW_MEMORY:
+            self._finish_without_address_snapshot("low_memory_close")
+            return
         if self.close_mode == "quick":
             self._finish_without_address_snapshot("quick_close")
             return
@@ -2535,6 +3075,22 @@ class DiskMonitorApp:
     def _on_close(self) -> None:
         if self.closing:
             return
+        if self.run_mode == RUN_MODE_LOW_MEMORY:
+            self.closing = True
+            self.baseline_pending = False
+            self.mode_toggle_button.configure(state=tk.DISABLED)
+            self.scan_button.configure(state=tk.DISABLED)
+            self.save_snapshot_button.configure(state=tk.DISABLED)
+            self.choose_directory_button.configure(state=tk.DISABLED)
+            self.up_button.configure(state=tk.DISABLED)
+            self.cancel_button.configure(state=tk.DISABLED)
+            self.path_entry.configure(state=tk.DISABLED)
+            if self.scan_thread and self.scan_thread.is_alive():
+                self.cancel_event.set()
+                self.status_var.set("正在停止意外残留的扫描并退出低内存模式……")
+                return
+            self._finish_without_address_snapshot("low_memory_close")
+            return
         close_behavior = self.storage.get_setting("close_behavior", "ask")
         if close_behavior == "ask":
             dialog = CloseChoiceDialog(self.root)
@@ -2546,6 +3102,7 @@ class DiskMonitorApp:
         else:
             self.close_mode = close_behavior
         self.closing = True
+        self.mode_toggle_button.configure(state=tk.DISABLED)
         self._cancel_treemap_animation()
         if self.treemap_resize_after_id is not None:
             try:

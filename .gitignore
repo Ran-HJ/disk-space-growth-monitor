@@ -4,5 +4,12 @@ build/
 __pycache__/
 *.py[cod]
 dist/
-# 内部工作文档（Codex 交接/协作 prompt），不推送到公开仓库
-交接文档.md
+
+# 内部工作文档，仅保留在本地，不推送到公开仓库
+/PROGRESS.md
+/交接文档.md
+/验收清单.md
+/优化建议-*.md
+/计划-*.md
+/需求-*.md
+/tests/results/
