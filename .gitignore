@@ -1,0 +1,8 @@
+.venv/
+build/
+*.spec
+__pycache__/
+*.py[cod]
+dist/
+# 内部工作文档（Codex 交接/协作 prompt），不推送到公开仓库
+交接文档.md
