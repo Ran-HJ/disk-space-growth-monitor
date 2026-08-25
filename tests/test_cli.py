@@ -128,6 +128,46 @@ class CliTests(unittest.TestCase):
         self.assertEqual(response["code"], "not_running")
         self.assertFalse(response["data"]["running"])
 
+    def test_automation_configuration_is_sent_to_gui(self) -> None:
+        client = Mock()
+        client.request.return_value = success_response(
+            "request", data={"status": "monitoring"}
+        )
+        with patch("disk_monitor.cli.ControlClient", return_value=client):
+            code, output, _ = self.run_cli(
+                [
+                    "automation",
+                    "configure",
+                    "--enabled",
+                    "on",
+                    "--processes",
+                    "cs2;r5apex.exe",
+                    "--memory-pressure",
+                    "on",
+                    "--high",
+                    "88",
+                    "--low",
+                    "72",
+                    "--resume-rescan",
+                    "later",
+                    "--json",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output)["data"]["status"], "monitoring")
+        client.request.assert_called_once_with(
+            "automation.configure",
+            {
+                "enabled": True,
+                "process_names": "cs2;r5apex.exe",
+                "memory_pressure_enabled": True,
+                "high_percent": 88,
+                "low_percent": 72,
+                "resume_rescan": "later",
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -15,6 +15,14 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from . import __version__
 from .agent_control import GuiAgentController
+from .automation import (
+    AutoDecision,
+    AutoModeConfig,
+    AutoModePolicy,
+    AutoObservation,
+    WindowsSystemProbe,
+    normalize_process_names,
+)
 from .autostart import is_autostart_enabled, set_autostart
 from .control_bridge import GuiControlBridge
 from .formatting import format_bytes
@@ -47,6 +55,7 @@ from .service import (
     split_sample_segments,
 )
 from .storage import Storage
+from .tray import TrayState, WindowsTrayIcon
 
 
 COLORS = {
@@ -88,6 +97,11 @@ RUN_MODE_LOW_MEMORY = "low_memory"
 RUN_MODE_LABELS = {
     RUN_MODE_FULL: "全功能模式",
     RUN_MODE_LOW_MEMORY: "低内存模式",
+}
+
+AUTO_RESCAN_LABELS = {
+    "later": "稍后手动补扫（推荐）",
+    "now": "立即补扫",
 }
 
 
@@ -170,6 +184,8 @@ class DiskMonitorApp:
         storage: Storage | None = None,
         initial_path: str = "C:\\",
         log_path: str | Path | None = None,
+        enable_tray: bool = False,
+        automation_probe: WindowsSystemProbe | None = None,
     ) -> None:
         self.root = root
         self.storage = storage or Storage()
@@ -181,6 +197,21 @@ class DiskMonitorApp:
         )
         if stored_run_mode not in RUN_MODE_LABELS:
             self.storage.set_setting("run_mode", self.run_mode)
+        self.auto_mode_config = AutoModeConfig.load(self.storage)
+        self.auto_mode_policy = AutoModePolicy(self.auto_mode_config)
+        self.automation_probe = automation_probe or WindowsSystemProbe()
+        self.auto_last_observation: AutoObservation | None = None
+        self.auto_last_decision: AutoDecision | None = None
+        self.automation_status_code = (
+            "monitoring" if self.auto_mode_config.enabled else "disabled"
+        )
+        self.automation_status_reason = (
+            "等待首次检测"
+            if self.auto_mode_config.enabled
+            else "自动模式未启用"
+        )
+        self.enable_tray = enable_tray
+        self.tray_icon: WindowsTrayIcon | None = None
         self.log_path = Path(log_path or self.storage.database_path.parent / "ui.log")
         self.logger = logging.getLogger(f"disk_monitor.ui.{id(self)}")
         self.logger.setLevel(logging.INFO)
@@ -261,6 +292,7 @@ class DiskMonitorApp:
         self.baseline_after_id: str | None = None
         self.destroy_after_id: str | None = None
         self.control_after_id: str | None = None
+        self.automation_after_id: str | None = None
         self.treemap_animation_after_id: str | None = None
         self.treemap_resize_after_id: str | None = None
         self.nav_stack = self._path_chain(requested_path)
@@ -270,6 +302,9 @@ class DiskMonitorApp:
         self.path_var = tk.StringVar(value=requested_path)
         self.status_var = tk.StringVar(value="准备就绪")
         self.mode_status_var = tk.StringVar(value=RUN_MODE_LABELS[self.run_mode])
+        self.automation_status_var = tk.StringVar(
+            value="自动：监控中" if self.auto_mode_config.enabled else "自动：关闭"
+        )
         self.mode_button_var = tk.StringVar(value="切换低内存模式")
         self.total_var = tk.StringVar(value="--")
         self.used_var = tk.StringVar(value="--")
@@ -328,6 +363,10 @@ class DiskMonitorApp:
             self.status_var.set(
                 "程序已启动，但 Agent 本地控制服务不可用；详情见 ui.log"
             )
+        self._start_tray()
+        self.automation_after_id = self.root.after(
+            1_500, self._poll_automation
+        )
 
     def _poll_control_requests(self) -> None:
         self.control_after_id = None
@@ -344,6 +383,296 @@ class DiskMonitorApp:
                     )
             except tk.TclError:
                 pass
+
+    def _start_tray(self) -> None:
+        if not self.enable_tray:
+            return
+        try:
+            self.tray_icon = WindowsTrayIcon(
+                self.app_icon_path,
+                lambda command: self.messages.put(("tray_command", command)),
+                logger=self.logger,
+            )
+            self.tray_icon.start()
+            self._update_tray_state()
+        except Exception:
+            self.logger.exception("tray_start_failed")
+            self.tray_icon = None
+            self.status_var.set(
+                "程序已启动，但 Windows 托盘不可用；详情见 ui.log"
+            )
+
+    def _window_is_visible(self) -> bool:
+        try:
+            return self.root.state() not in {"withdrawn", "iconic"}
+        except tk.TclError:
+            return False
+
+    def _update_tray_state(self) -> None:
+        if self.tray_icon is None:
+            return
+        scan_busy = self.active_scan_role is not None or bool(
+            self.scan_thread and self.scan_thread.is_alive()
+        )
+        self.tray_icon.update_state(
+            TrayState(
+                RUN_MODE_LABELS[self.run_mode],
+                self.automation_status_var.get(),
+                self._window_is_visible(),
+                scan_busy,
+            )
+        )
+
+    def _notify_tray(self, title: str, message: str) -> None:
+        if self.tray_icon is not None:
+            self.tray_icon.notify(title, message)
+
+    def _on_window_visibility_changed(self, _event: tk.Event | None = None) -> None:
+        if _event is None or _event.widget is self.root:
+            self._update_tray_state()
+
+    def _handle_tray_command(self, command: str) -> None:
+        if self.closing:
+            return
+        if command == "show":
+            self.root.deiconify()
+            self.root.state("normal")
+            self.root.lift()
+            self.root.focus_force()
+        elif command == "hide":
+            self.root.withdraw()
+        elif command == "mode_low":
+            if self.session_id is None or self.session_start_sample is None:
+                self._notify_tray("尚未就绪", "请等待首次磁盘采样完成")
+            elif self.active_scan_role is not None or (
+                self.scan_thread and self.scan_thread.is_alive()
+            ):
+                self._notify_tray("扫描进行中", "扫描结束后才能切换低内存模式")
+            elif self.run_mode != RUN_MODE_LOW_MEMORY:
+                self._enter_low_memory_mode()
+                self._note_manual_mode_change("tray")
+        elif command == "mode_full":
+            if self.session_id is None or self.session_start_sample is None:
+                self._notify_tray("尚未就绪", "请等待首次磁盘采样完成")
+            elif self.run_mode != RUN_MODE_FULL:
+                self._leave_low_memory_mode(should_scan=False)
+                self._note_manual_mode_change("tray")
+        elif command == "rescan":
+            if self.run_mode == RUN_MODE_FULL:
+                self._refresh_current_path()
+        elif command == "settings":
+            self.root.deiconify()
+            self.root.state("normal")
+            self.root.lift()
+            self._open_settings()
+        elif command == "exit_quick":
+            self._request_controlled_close("quick")
+        elif command == "exit_full":
+            self._request_controlled_close("full")
+        else:
+            self.logger.warning("unknown_tray_command command=%s", command)
+        self._update_tray_state()
+
+    def _poll_automation(self) -> None:
+        self.automation_after_id = None
+        try:
+            self._run_automation_check()
+        except Exception as error:
+            self.logger.exception("automation_poll_failed")
+            self._set_automation_status("error", str(error))
+        finally:
+            try:
+                if self.root.winfo_exists() and not self.closing:
+                    self.automation_after_id = self.root.after(
+                        self.auto_mode_config.poll_interval_ms,
+                        self._poll_automation,
+                    )
+            except tk.TclError:
+                pass
+
+    def _run_automation_check(
+        self, observation: AutoObservation | None = None
+    ) -> AutoDecision | None:
+        if not self.auto_mode_config.enabled:
+            decision = self.auto_mode_policy.evaluate(
+                observation or AutoObservation(0),
+                run_mode=self.run_mode,
+                scan_busy=False,
+            )
+            self.auto_last_decision = decision
+            self._set_automation_status(decision.status, decision.reason)
+            return decision
+        if self.session_id is None or self.session_start_sample is None:
+            self._set_automation_status("initializing", "等待首次磁盘采样")
+            return None
+        current_observation = observation or self.automation_probe.observe(
+            self.auto_mode_config.process_names
+        )
+        self.auto_last_observation = current_observation
+        scan_busy = self.active_scan_role is not None or bool(
+            self.scan_thread and self.scan_thread.is_alive()
+        )
+        decision = self.auto_mode_policy.evaluate(
+            current_observation,
+            run_mode=self.run_mode,
+            scan_busy=scan_busy,
+        )
+        self.auto_last_decision = decision
+        self._set_automation_status(decision.status, decision.reason)
+        if decision.action == "enter_low":
+            self._enter_low_memory_mode()
+            self.auto_mode_policy.mark_auto_entered()
+            self._set_automation_status("auto_low", decision.reason)
+            self.status_var.set(f"已自动切换低内存模式：{decision.reason}")
+            self._notify_tray("已自动切换低内存模式", decision.reason)
+            self.logger.info(
+                "automation_mode_changed mode=low_memory reason=%s",
+                decision.reason,
+            )
+        elif decision.action == "leave_low":
+            should_scan = self.auto_mode_config.resume_rescan == "now"
+            change_text = self._low_memory_change_text()
+            if self._leave_low_memory_mode(should_scan=should_scan):
+                self.auto_mode_policy.mark_auto_left()
+                self._set_automation_status("monitoring", decision.reason)
+                suffix = "正在补扫当前路径" if should_scan else "可稍后手动补扫"
+                self.status_var.set(
+                    f"已自动恢复全功能模式；{change_text}；{suffix}"
+                )
+                self._notify_tray(
+                    "已自动恢复全功能模式",
+                    f"{change_text}；{suffix}",
+                )
+                self.logger.info(
+                    "automation_mode_changed mode=full rescan=%s",
+                    should_scan,
+                )
+        self._update_tray_state()
+        return decision
+
+    def _low_memory_change_text(self) -> str:
+        if self.latest_disk_sample is None or self.low_memory_start_sample is None:
+            return "低内存期间变化尚无可用采样"
+        change = (
+            self.latest_disk_sample.used_bytes
+            - self.low_memory_start_sample.used_bytes
+        )
+        sign = "+" if change > 0 else ""
+        return f"低内存期间磁盘变化 {sign}{format_bytes(change)}"
+
+    def _set_automation_status(self, status: str, reason: str) -> None:
+        labels = {
+            "disabled": "自动：关闭",
+            "initializing": "自动：初始化",
+            "monitoring": "自动：监控中",
+            "detecting": "自动：确认触发",
+            "waiting_for_scan": "自动：等待扫描",
+            "switching": "自动：切换中",
+            "auto_low": "自动：低内存",
+            "recovering": "自动：等待恢复",
+            "manual_override": "自动：人工优先",
+            "manual_low": "自动：人工低内存",
+            "error": "自动：检测异常",
+        }
+        self.automation_status_code = status
+        self.automation_status_reason = reason
+        label = labels.get(status, "自动：未知")
+        if self.auto_last_observation is not None and status != "disabled":
+            label += f" · 内存 {self.auto_last_observation.memory_percent}%"
+        self.automation_status_var.set(label)
+        self._update_tray_state()
+
+    def _note_manual_mode_change(self, source: str) -> None:
+        self.auto_mode_policy.note_manual_mode_change()
+        self.logger.info("automation_manual_override source=%s", source)
+        if self.auto_mode_config.enabled:
+            self._set_automation_status(
+                "manual_override"
+                if self.auto_mode_policy.manual_hold
+                else "monitoring",
+                "人工模式选择优先",
+            )
+
+    def _automation_data(self) -> dict[str, object]:
+        decision = self.auto_last_decision
+        return {
+            "config": self.auto_mode_config.to_dict(),
+            "status": self.automation_status_code,
+            "reason": self.automation_status_reason,
+            "owns_low_mode": self.auto_mode_policy.owns_low_mode,
+            "manual_hold": self.auto_mode_policy.manual_hold,
+            "triggers": list(decision.triggers) if decision else [],
+            "observation": (
+                self.auto_last_observation.to_dict()
+                if self.auto_last_observation is not None
+                else None
+            ),
+        }
+
+    def _apply_automation_config(
+        self, config: AutoModeConfig, *, persist: bool = True
+    ) -> None:
+        config.validate()
+        if persist:
+            config.save(self.storage)
+        self.auto_mode_config = config
+        self.auto_mode_policy.update_config(config)
+        self.auto_last_decision = None
+        self._set_automation_status(
+            "monitoring" if config.enabled else "disabled",
+            "等待下次检测" if config.enabled else "自动模式未启用",
+        )
+        if self.automation_after_id is not None:
+            try:
+                self.root.after_cancel(self.automation_after_id)
+            except tk.TclError:
+                pass
+        self.automation_after_id = self.root.after(250, self._poll_automation)
+
+    def _update_automation_from_control(
+        self, changes: dict[str, object]
+    ) -> dict[str, object]:
+        current = self.auto_mode_config
+
+        def boolean_value(key: str, default: bool) -> bool:
+            value = changes.get(key, default)
+            if not isinstance(value, bool):
+                raise ValueError(f"{key} 必须是布尔值")
+            return value
+
+        process_value = changes.get("process_names", current.process_names)
+        if not isinstance(process_value, (str, list, tuple)):
+            raise ValueError("process_names 必须是字符串或字符串列表")
+        if isinstance(process_value, (list, tuple)) and not all(
+            isinstance(item, str) for item in process_value
+        ):
+            raise ValueError("process_names 列表只能包含字符串")
+
+        def integer_value(key: str, default: int) -> int:
+            value = changes.get(key, default)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(f"{key} 必须是整数")
+            return value
+
+        resume_rescan = changes.get("resume_rescan", current.resume_rescan)
+        if not isinstance(resume_rescan, str):
+            raise ValueError("resume_rescan 必须是字符串")
+        config = AutoModeConfig(
+            enabled=boolean_value("enabled", current.enabled),
+            process_names=normalize_process_names(
+                tuple(process_value)
+                if isinstance(process_value, (list, tuple))
+                else process_value
+            ),
+            memory_pressure_enabled=boolean_value(
+                "memory_pressure_enabled", current.memory_pressure_enabled
+            ),
+            high_percent=integer_value("high_percent", current.high_percent),
+            low_percent=integer_value("low_percent", current.low_percent),
+            resume_rescan=resume_rescan,
+        ).validate()
+        self._apply_automation_config(config)
+        return self._automation_data()
 
     def _report_callback_exception(
         self, exception_type: type[BaseException], exception: BaseException, traceback
@@ -374,8 +703,11 @@ class DiskMonitorApp:
             getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent)
         )
         icon_path = bundle_root / "assets" / "app.ico"
+        self.app_icon_path = icon_path
         if icon_path.exists():
             self.root.iconbitmap(default=str(icon_path))
+        self.root.bind("<Map>", self._on_window_visibility_changed, add="+")
+        self.root.bind("<Unmap>", self._on_window_visibility_changed, add="+")
 
     def _configure_styles(self) -> None:
         style = ttk.Style()
@@ -446,6 +778,11 @@ class DiskMonitorApp:
         ttk.Label(
             title_row,
             textvariable=self.mode_status_var,
+            style="Subtitle.TLabel",
+        ).pack(side=tk.RIGHT, padx=(0, 10), pady=(4, 0))
+        ttk.Label(
+            title_row,
+            textvariable=self.automation_status_var,
             style="Subtitle.TLabel",
         ).pack(side=tk.RIGHT, padx=(0, 10), pady=(4, 0))
 
@@ -1097,8 +1434,12 @@ class DiskMonitorApp:
                 )
                 return False
             self._enter_low_memory_mode()
+            self._note_manual_mode_change("gui")
             return True
-        return self._leave_low_memory_mode()
+        switched = self._leave_low_memory_mode()
+        if switched:
+            self._note_manual_mode_change("gui")
+        return switched
 
     def _toggle_run_mode(self) -> None:
         requested_mode = (
@@ -1143,6 +1484,7 @@ class DiskMonitorApp:
             "run_mode_changed mode=low_memory reference_snapshot_id=%s",
             reference_id,
         )
+        self._update_tray_state()
 
     def _leave_low_memory_mode(
         self, *, should_scan: bool | None = None
@@ -1204,6 +1546,7 @@ class DiskMonitorApp:
             should_scan,
             reference_id,
         )
+        self._update_tray_state()
         return True
 
     def _record_mode_boundary_sample(self) -> DiskSample:
@@ -1336,14 +1679,80 @@ class DiskMonitorApp:
             text="登录 Windows 后自动启动监控器",
             variable=autostart_var,
         ).grid(row=4, column=0, sticky=tk.W, pady=(16, 4))
+
+        ttk.Separator(body).grid(row=5, column=0, sticky=tk.EW, pady=(12, 12))
+        ttk.Label(
+            body,
+            text="自动低内存模式",
+            font=("Microsoft YaHei UI", 10, "bold"),
+        ).grid(row=6, column=0, sticky=tk.W, pady=(0, 6))
+        auto_enabled_var = tk.BooleanVar(value=self.auto_mode_config.enabled)
+        ttk.Checkbutton(
+            body,
+            text="检测指定进程或内存压力后自动切换",
+            variable=auto_enabled_var,
+        ).grid(row=7, column=0, sticky=tk.W)
+        ttk.Label(
+            body,
+            text="监控进程（分号分隔，可省略 .exe）",
+            foreground=COLORS["muted"],
+        ).grid(row=8, column=0, sticky=tk.W, pady=(8, 2))
+        process_names_var = tk.StringVar(
+            value=";".join(self.auto_mode_config.process_names)
+        )
+        ttk.Entry(
+            body,
+            textvariable=process_names_var,
+            width=48,
+        ).grid(row=9, column=0, sticky=tk.EW)
+        memory_pressure_var = tk.BooleanVar(
+            value=self.auto_mode_config.memory_pressure_enabled
+        )
+        ttk.Checkbutton(
+            body,
+            text="使用系统内存压力作为兜底触发条件",
+            variable=memory_pressure_var,
+        ).grid(row=10, column=0, sticky=tk.W, pady=(8, 2))
+        threshold_row = ttk.Frame(body)
+        threshold_row.grid(row=11, column=0, sticky=tk.W)
+        high_percent_var = tk.StringVar(
+            value=str(self.auto_mode_config.high_percent)
+        )
+        low_percent_var = tk.StringVar(
+            value=str(self.auto_mode_config.low_percent)
+        )
+        ttk.Label(threshold_row, text="进入阈值").pack(side=tk.LEFT)
+        ttk.Entry(
+            threshold_row, textvariable=high_percent_var, width=5
+        ).pack(side=tk.LEFT, padx=(4, 2))
+        ttk.Label(threshold_row, text="%　恢复阈值").pack(side=tk.LEFT)
+        ttk.Entry(
+            threshold_row, textvariable=low_percent_var, width=5
+        ).pack(side=tk.LEFT, padx=(4, 2))
+        ttk.Label(threshold_row, text="%").pack(side=tk.LEFT)
+        ttk.Label(
+            body,
+            text="自动恢复全功能后的处理",
+            foreground=COLORS["muted"],
+        ).grid(row=12, column=0, sticky=tk.W, pady=(8, 2))
+        resume_rescan_var = tk.StringVar(
+            value=AUTO_RESCAN_LABELS[self.auto_mode_config.resume_rescan]
+        )
+        ttk.Combobox(
+            body,
+            textvariable=resume_rescan_var,
+            values=tuple(AUTO_RESCAN_LABELS.values()),
+            state="readonly",
+            width=28,
+        ).grid(row=13, column=0, sticky=tk.W)
         ttk.Label(
             body,
             text="分钟采样保留 30 天，原始目录快照保留 90 天。",
             foreground=COLORS["muted"],
-        ).grid(row=5, column=0, sticky=tk.W, pady=(4, 16))
+        ).grid(row=14, column=0, sticky=tk.W, pady=(12, 16))
 
         buttons = ttk.Frame(body)
-        buttons.grid(row=6, column=0, sticky=tk.E)
+        buttons.grid(row=15, column=0, sticky=tk.E)
 
         def save_settings() -> None:
             behavior = next(
@@ -1356,12 +1765,31 @@ class DiskMonitorApp:
                 for key, label in RUN_MODE_LABELS.items()
                 if label == run_mode_var.get()
             )
+            try:
+                auto_config = AutoModeConfig(
+                    enabled=auto_enabled_var.get(),
+                    process_names=normalize_process_names(
+                        process_names_var.get()
+                    ),
+                    memory_pressure_enabled=memory_pressure_var.get(),
+                    high_percent=int(high_percent_var.get().strip()),
+                    low_percent=int(low_percent_var.get().strip()),
+                    resume_rescan=next(
+                        key
+                        for key, label in AUTO_RESCAN_LABELS.items()
+                        if label == resume_rescan_var.get()
+                    ),
+                ).validate()
+            except (ValueError, StopIteration) as error:
+                messagebox.showerror("设置无效", str(error), parent=window)
+                return
             if not self._request_run_mode(requested_mode):
                 return
             try:
                 self.storage.set_setting("close_behavior", behavior)
                 set_autostart(autostart_var.get())
-            except OSError as error:
+                self._apply_automation_config(auto_config)
+            except (OSError, ValueError) as error:
                 messagebox.showerror("设置失败", str(error), parent=window)
                 return
             self.status_var.set("设置已保存")
@@ -1624,6 +2052,7 @@ class DiskMonitorApp:
             daemon=True,
         )
         self.scan_thread.start()
+        self._update_tray_state()
 
     def _scan_worker(
         self,
@@ -1735,7 +2164,9 @@ class DiskMonitorApp:
             while True:
                 message = self.messages.get_nowait()
                 kind = message[0]
-                if kind == "scan_progress":
+                if kind == "tray_command":
+                    self._handle_tray_command(message[1])
+                elif kind == "scan_progress":
                     self.agent_controller.on_scan_progress(message[1])
                     self._show_progress(message[1])
                 elif kind == "scan_done":
@@ -1881,6 +2312,7 @@ class DiskMonitorApp:
         )
         if not self.closing:
             self._refresh_breadcrumbs()
+        self._update_tray_state()
 
     def _show_scan_result(
         self,
@@ -3069,6 +3501,7 @@ class DiskMonitorApp:
             "baseline_after_id",
             "destroy_after_id",
             "control_after_id",
+            "automation_after_id",
             "treemap_animation_after_id",
             "treemap_resize_after_id",
         ):
@@ -3079,6 +3512,12 @@ class DiskMonitorApp:
                 except tk.TclError:
                     pass
                 setattr(self, attribute, None)
+        if self.tray_icon is not None:
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                self.logger.exception("tray_stop_failed")
+            self.tray_icon = None
         if self.control_bridge is not None:
             try:
                 self.control_bridge.stop()
@@ -3185,5 +3624,5 @@ class DiskMonitorApp:
 def main() -> None:
     root = tk.Tk()
     initial_path = os.environ.get("DISK_GROWTH_MONITOR_INITIAL_PATH", "C:\\")
-    DiskMonitorApp(root, initial_path=initial_path)
+    DiskMonitorApp(root, initial_path=initial_path, enable_tray=True)
     root.mainloop()

@@ -50,6 +50,23 @@ def build_parser() -> argparse.ArgumentParser:
     mode_set.add_argument("mode", choices=("full", "low_memory"))
     mode_set.add_argument("--rescan", choices=("now", "later"))
 
+    automation = groups.add_parser("automation")
+    automation_commands = automation.add_subparsers(dest="action", required=True)
+    automation_commands.add_parser("status", parents=[common])
+    automation_configure = automation_commands.add_parser(
+        "configure", parents=[common]
+    )
+    automation_configure.add_argument("--enabled", choices=("on", "off"))
+    automation_configure.add_argument("--processes")
+    automation_configure.add_argument(
+        "--memory-pressure", choices=("on", "off")
+    )
+    automation_configure.add_argument("--high", type=int)
+    automation_configure.add_argument("--low", type=int)
+    automation_configure.add_argument(
+        "--resume-rescan", choices=("now", "later")
+    )
+
     scan = groups.add_parser("scan")
     scan_commands = scan.add_subparsers(dest="action", required=True)
     scan_start = scan_commands.add_parser("start", parents=[common])
@@ -337,6 +354,25 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 "mode.set",
                 {"mode": args.mode, "rescan": args.rescan},
             )
+        if args.group == "automation":
+            if args.action == "status":
+                return _runtime_request(args, "automation.status")
+            payload: dict[str, Any] = {}
+            if args.enabled is not None:
+                payload["enabled"] = args.enabled == "on"
+            if args.processes is not None:
+                payload["process_names"] = args.processes
+            if args.memory_pressure is not None:
+                payload["memory_pressure_enabled"] = (
+                    args.memory_pressure == "on"
+                )
+            if args.high is not None:
+                payload["high_percent"] = args.high
+            if args.low is not None:
+                payload["low_percent"] = args.low
+            if args.resume_rescan is not None:
+                payload["resume_rescan"] = args.resume_rescan
+            return _runtime_request(args, "automation.configure", payload)
         if args.group == "scan":
             if args.action == "start":
                 return _runtime_request(args, "scan.start", {"path": args.path})

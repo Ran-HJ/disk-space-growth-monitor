@@ -97,6 +97,8 @@ class GuiAgentController:
                 "app.close": self._app_close,
                 "mode.get": self._mode_get,
                 "mode.set": self._mode_set,
+                "automation.status": self._automation_status,
+                "automation.configure": self._automation_configure,
                 "scan.start": self._scan_start,
                 "scan.rescan": self._scan_rescan,
                 "scan.status": self._scan_status,
@@ -172,6 +174,8 @@ class GuiAgentController:
                 "session_id": self.app.session_id,
                 "closing": self.app.closing,
                 "scan": self._current_task_data(),
+                "automation": self.app._automation_data(),
+                "tray_available": self.app.tray_icon is not None,
             },
         )
 
@@ -206,6 +210,7 @@ class GuiAgentController:
             data={
                 "mode": self.app.run_mode,
                 "changed_at": _datetime_text(self.app.low_memory_started_at),
+                "automation": self.app._automation_data(),
             },
         )
 
@@ -222,6 +227,7 @@ class GuiAgentController:
         if mode == "low_memory" and rescan is not None:
             raise ControlError("invalid_args", "切换低内存模式不接受 rescan")
         if mode == self.app.run_mode:
+            self.app._note_manual_mode_change("agent")
             return success_response(
                 request_id,
                 code="already_set",
@@ -231,6 +237,7 @@ class GuiAgentController:
         if mode == "low_memory":
             self._require_idle_scan()
             self.app._enter_low_memory_mode()
+            self.app._note_manual_mode_change("agent")
             return success_response(
                 request_id,
                 message="已切换到低内存模式",
@@ -251,6 +258,7 @@ class GuiAgentController:
             if should_scan:
                 self._fail_task(request_id, "切回全功能模式被取消")
             raise ControlError("internal_error", "切回全功能模式失败")
+        self.app._note_manual_mode_change("agent")
         return success_response(
             request_id,
             message="已切换到全功能模式",
@@ -259,6 +267,35 @@ class GuiAgentController:
                 "rescan": rescan,
                 "scan": self.tasks.get(request_id),
             },
+        )
+
+    def _automation_status(
+        self, request_id: str, _args: dict[str, Any]
+    ) -> dict[str, Any]:
+        return success_response(request_id, data=self.app._automation_data())
+
+    def _automation_configure(
+        self, request_id: str, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        self._require_ready()
+        allowed = {
+            "enabled",
+            "process_names",
+            "memory_pressure_enabled",
+            "high_percent",
+            "low_percent",
+            "resume_rescan",
+        }
+        unknown = sorted(set(args) - allowed)
+        if unknown:
+            raise ControlError(
+                "invalid_args", "未知自动模式参数：" + ", ".join(unknown)
+            )
+        data = self.app._update_automation_from_control(args)
+        return success_response(
+            request_id,
+            message="自动模式设置已更新",
+            data=data,
         )
 
     def _start_task_scan(
