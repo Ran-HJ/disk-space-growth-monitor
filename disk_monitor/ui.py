@@ -14,7 +14,9 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from . import __version__
+from .agent_control import GuiAgentController
 from .autostart import is_autostart_enabled, set_autostart
+from .control_bridge import GuiControlBridge
 from .formatting import format_bytes
 from .growth_tree import GrowthTreeNode, build_growth_tree
 from .models import (
@@ -258,6 +260,7 @@ class DiskMonitorApp:
         self.sample_after_id: str | None = None
         self.baseline_after_id: str | None = None
         self.destroy_after_id: str | None = None
+        self.control_after_id: str | None = None
         self.treemap_animation_after_id: str | None = None
         self.treemap_resize_after_id: str | None = None
         self.nav_stack = self._path_chain(requested_path)
@@ -309,6 +312,38 @@ class DiskMonitorApp:
         )
         self.poll_after_id = self.root.after(100, self._poll_messages)
         self.sample_after_id = self.root.after(200, self._sample_now)
+        self.agent_controller = GuiAgentController(self)
+        self.control_bridge: GuiControlBridge | None = None
+        try:
+            self.control_bridge = GuiControlBridge(
+                self.storage.database_path.parent,
+                logger=self.logger,
+            )
+            self.control_bridge.start()
+            self.control_after_id = self.root.after(
+                50, self._poll_control_requests
+            )
+        except Exception:
+            self.logger.exception("control_server_start_failed")
+            self.status_var.set(
+                "程序已启动，但 Agent 本地控制服务不可用；详情见 ui.log"
+            )
+
+    def _poll_control_requests(self) -> None:
+        self.control_after_id = None
+        try:
+            if self.control_bridge is not None:
+                self.control_bridge.drain(self.agent_controller.handle)
+        except Exception:
+            self.logger.exception("control_bridge_poll_failed")
+        finally:
+            try:
+                if self.root.winfo_exists() and not self.closing:
+                    self.control_after_id = self.root.after(
+                        50, self._poll_control_requests
+                    )
+            except tk.TclError:
+                pass
 
     def _report_callback_exception(
         self, exception_type: type[BaseException], exception: BaseException, traceback
@@ -1109,16 +1144,19 @@ class DiskMonitorApp:
             reference_id,
         )
 
-    def _leave_low_memory_mode(self) -> bool:
+    def _leave_low_memory_mode(
+        self, *, should_scan: bool | None = None
+    ) -> bool:
         cold_start = self.low_memory_origin == "cold"
-        should_scan = True
         if cold_start:
-            messagebox.showinfo(
-                "建立文件基线",
-                "此前只有磁盘口径记录，无文件地址明细；本次建立新基线。",
-                parent=self.root,
-            )
-        else:
+            if should_scan is None:
+                messagebox.showinfo(
+                    "建立文件基线",
+                    "此前只有磁盘口径记录，无文件地址明细；本次建立新基线。",
+                    parent=self.root,
+                )
+                should_scan = True
+        elif should_scan is None:
             answer = messagebox.askyesnocancel(
                 "切回全功能模式",
                 "是否立即扫描当前监控路径并重建空间分布？\n\n"
@@ -1128,6 +1166,7 @@ class DiskMonitorApp:
             if answer is None:
                 return False
             should_scan = bool(answer)
+        assert should_scan is not None
 
         reference_id = self.low_memory_reference_snapshot_id
         try:
@@ -1697,6 +1736,7 @@ class DiskMonitorApp:
                 message = self.messages.get_nowait()
                 kind = message[0]
                 if kind == "scan_progress":
+                    self.agent_controller.on_scan_progress(message[1])
                     self._show_progress(message[1])
                 elif kind == "scan_done":
                     role, result, growth, has_baseline, previous_id = message[1:]
@@ -1738,7 +1778,9 @@ class DiskMonitorApp:
                                 )
                         if self.notebook.select() == str(self.history_tab):
                             self._load_snapshot_history(reset=True)
+                        self.agent_controller.on_scan_completed(role, result)
                     except Exception as error:
+                        self.agent_controller.on_scan_failed(role, str(error))
                         self._record_ui_error("扫描结果界面处理", error)
                     finally:
                         self._finish_scan_ui()
@@ -1748,6 +1790,7 @@ class DiskMonitorApp:
                         else:
                             self._start_pending_baseline()
                 elif kind == "scan_cancelled":
+                    self.agent_controller.on_scan_cancelled(message[1])
                     self.status_var.set("扫描已取消，未保存不完整快照")
                     self._finish_scan_ui()
                     if self.closing:
@@ -1756,6 +1799,7 @@ class DiskMonitorApp:
                         self._start_pending_baseline()
                 elif kind == "scan_error":
                     role, error = message[1:]
+                    self.agent_controller.on_scan_failed(role, error)
                     self.status_var.set(f"扫描失败：{error}")
                     if role == "baseline" and self.cold_low_memory_baseline_pending:
                         self.cold_low_memory_baseline_pending = False
@@ -3024,6 +3068,7 @@ class DiskMonitorApp:
             "sample_after_id",
             "baseline_after_id",
             "destroy_after_id",
+            "control_after_id",
             "treemap_animation_after_id",
             "treemap_resize_after_id",
         ):
@@ -3034,6 +3079,12 @@ class DiskMonitorApp:
                 except tk.TclError:
                     pass
                 setattr(self, attribute, None)
+        if self.control_bridge is not None:
+            try:
+                self.control_bridge.stop()
+            except Exception:
+                self.logger.exception("control_server_stop_failed")
+            self.control_bridge = None
         self.navigation_skeleton = None
         try:
             if self.root.winfo_exists():
@@ -3075,32 +3126,28 @@ class DiskMonitorApp:
     def _on_close(self) -> None:
         if self.closing:
             return
-        if self.run_mode == RUN_MODE_LOW_MEMORY:
-            self.closing = True
-            self.baseline_pending = False
-            self.mode_toggle_button.configure(state=tk.DISABLED)
-            self.scan_button.configure(state=tk.DISABLED)
-            self.save_snapshot_button.configure(state=tk.DISABLED)
-            self.choose_directory_button.configure(state=tk.DISABLED)
-            self.up_button.configure(state=tk.DISABLED)
-            self.cancel_button.configure(state=tk.DISABLED)
-            self.path_entry.configure(state=tk.DISABLED)
-            if self.scan_thread and self.scan_thread.is_alive():
-                self.cancel_event.set()
-                self.status_var.set("正在停止意外残留的扫描并退出低内存模式……")
-                return
-            self._finish_without_address_snapshot("low_memory_close")
+        if self.run_mode != RUN_MODE_LOW_MEMORY:
+            close_behavior = self.storage.get_setting("close_behavior", "ask")
+            if close_behavior == "ask":
+                dialog = CloseChoiceDialog(self.root)
+                if dialog.choice is None:
+                    return
+                self.close_mode = dialog.choice
+                if dialog.remember:
+                    self.storage.set_setting("close_behavior", dialog.choice)
+            else:
+                self.close_mode = close_behavior
+        self._begin_close_sequence()
+
+    def _request_controlled_close(self, behavior: str) -> None:
+        if self.closing:
             return
-        close_behavior = self.storage.get_setting("close_behavior", "ask")
-        if close_behavior == "ask":
-            dialog = CloseChoiceDialog(self.root)
-            if dialog.choice is None:
-                return
-            self.close_mode = dialog.choice
-            if dialog.remember:
-                self.storage.set_setting("close_behavior", dialog.choice)
-        else:
-            self.close_mode = close_behavior
+        if behavior not in {"full", "quick"}:
+            raise ValueError("关闭方式必须是 full 或 quick")
+        self.close_mode = behavior
+        self._begin_close_sequence()
+
+    def _begin_close_sequence(self) -> None:
         self.closing = True
         self.mode_toggle_button.configure(state=tk.DISABLED)
         self._cancel_treemap_animation()
@@ -3116,6 +3163,13 @@ class DiskMonitorApp:
         self.up_button.configure(state=tk.DISABLED)
         self.cancel_button.configure(state=tk.DISABLED)
         self.path_entry.configure(state=tk.DISABLED)
+        if self.run_mode == RUN_MODE_LOW_MEMORY:
+            if self.scan_thread and self.scan_thread.is_alive():
+                self.cancel_event.set()
+                self.status_var.set("正在停止意外残留的扫描并退出低内存模式……")
+                return
+            self._finish_without_address_snapshot("low_memory_close")
+            return
         if self.scan_thread and self.scan_thread.is_alive():
             if self.active_scan_role == "baseline" and self.close_mode == "full":
                 self.status_var.set(

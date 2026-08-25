@@ -2,7 +2,7 @@
 
 这是一个面向 Windows 的磁盘空间监控工具。全功能模式通过启动和关闭目录快照定位空间变化；低内存模式只保留磁盘容量采样、趋势和历史快照查看，适合游戏等需要让出内存的场景。
 
-> 当前稳定版：v0.7.1（工程硬化；保留 v0.7.0 手动低内存模式的功能与口径）。
+> 当前稳定版：v0.7.2（新增 Agent 本地控制接口和独立 CLI）。
 
 ## 当前功能
 
@@ -50,6 +50,9 @@
 - 深层目录扫描不依赖 Python 递归深度，异常深的目录树不会因 `RecursionError` 中断
 - 数据库使用 schema 版本登记并拒绝由更高版本程序创建的数据库，旧库会原地兼容升级
 - 进程退出阶段保存失败会写入日志，未完成会话仍由下次启动恢复
+- 提供独立 Agent CLI，可控制模式切换、扫描、目录导航、快照保存和关闭，并读取当前或历史数据
+- GUI 控制使用当前 Windows 用户下的随机命名管道和每次启动更新的认证密钥；不开放网络端口
+- GUI 未运行时，历史查询只读打开 SQLite，不初始化、不迁移也不修改监控数据库
 
 ## 直接运行
 
@@ -57,6 +60,17 @@
 
 ```powershell
 python run.py
+```
+
+Agent CLI 源码运行入口：
+
+```powershell
+python run_cli.py app status --json
+python run_cli.py mode set low_memory --json
+python run_cli.py mode set full --rescan later --json
+python run_cli.py scan start "D:\data" --json
+python run_cli.py scan wait --request-id REQUEST_ID --json
+python run_cli.py tree current --limit 20 --json
 ```
 
 程序数据保存在：
@@ -70,6 +84,36 @@ python run.py
 ```text
 %LOCALAPPDATA%\DiskGrowthMonitor\ui.log
 ```
+
+## Agent 本地控制接口
+
+发布包包含两个程序：
+
+- `disk-space-growth-monitor-v0.7.2.exe`：图形界面和控制服务。
+- `diskmonitor-cli-v0.7.2.exe`：供用户、脚本或本地 Agent 调用的命令行客户端。
+
+常用操作：
+
+```powershell
+# 幂等启动；GUI 已运行时不会抢窗口焦点
+.\diskmonitor-cli-v0.7.2.exe app start --json
+
+# 明确切换模式；低内存模式会拒绝扫描
+.\diskmonitor-cli-v0.7.2.exe mode set low_memory --json
+.\diskmonitor-cli-v0.7.2.exe mode set full --rescan now --json
+
+# 启动扫描后，用响应中的 request_id 等待或读取结果
+.\diskmonitor-cli-v0.7.2.exe scan start "D:\data" --json
+.\diskmonitor-cli-v0.7.2.exe scan wait --request-id REQUEST_ID --json
+
+# Agent 导航和数据读取
+.\diskmonitor-cli-v0.7.2.exe view open "D:\data\logs" --scan-if-missing --json
+.\diskmonitor-cli-v0.7.2.exe growth current --limit 20 --json
+.\diskmonitor-cli-v0.7.2.exe snapshot list --limit 20 --json
+.\diskmonitor-cli-v0.7.2.exe session last --json
+```
+
+所有响应都带协议版本、状态码、请求编号和 UTC 响应时间。扫描是异步任务；CLI 不会静默切换模式。控制接口只有白名单操作，不支持删除文件、执行任意命令或远程网络访问。认证密钥不会写入 JSON 响应或日志。
 
 ## 使用方法
 
@@ -110,7 +154,8 @@ python -m pip install -r requirements-build.txt
 
 `build.ps1` 是唯一打包配置源，显式关闭 UPX；PyInstaller 自动生成的
 `.spec` 属于临时产物，不纳入版本控制。生成的程序位于
-`dist/C盘空间增长监控器.exe`。
+`dist/disk-space-growth-monitor-v0.7.2.exe` 和
+`dist/diskmonitor-cli-v0.7.2.exe`。
 
 ## 已知边界
 

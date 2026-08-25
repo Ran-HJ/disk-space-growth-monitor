@@ -15,12 +15,12 @@ VSVersionInfo(
         '080404b0',
         [
           StringStruct('CompanyName', '个人工具'),
-          StringStruct('FileDescription', 'C 盘空间增长监控器'),
+          StringStruct('FileDescription', 'Disk Growth Monitor Agent CLI'),
           StringStruct('FileVersion', '0.7.2'),
-          StringStruct('InternalName', 'DiskGrowthMonitor'),
+          StringStruct('InternalName', 'DiskGrowthMonitorCLI'),
           StringStruct('LegalCopyright', 'Copyright 2026'),
-          StringStruct('OriginalFilename', 'disk-space-growth-monitor-v0.7.2.exe'),
-          StringStruct('ProductName', 'C 盘空间增长监控器'),
+          StringStruct('OriginalFilename', 'diskmonitor-cli-v0.7.2.exe'),
+          StringStruct('ProductName', 'C 盘空间增长监控器 Agent CLI'),
           StringStruct('ProductVersion', '0.7.2')
         ]
       )
