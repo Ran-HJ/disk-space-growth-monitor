@@ -20,6 +20,13 @@ from .service import read_disk_sample
 from .storage import default_database_path
 
 
+def _configure_standard_streams() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8")
+
+
 def _common_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--json", action="store_true", dest="json_output")
@@ -528,6 +535,7 @@ def _exit_code(response: dict[str, Any]) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _configure_standard_streams()
     args = build_parser().parse_args(argv)
     response = dispatch(args)
     if getattr(args, "json_output", False):

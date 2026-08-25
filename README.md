@@ -2,7 +2,7 @@
 
 这是一个面向 Windows 的磁盘空间监控工具。全功能模式通过启动和关闭目录快照定位空间变化；低内存模式只保留磁盘容量采样、趋势和历史快照查看，适合游戏等需要让出内存的场景。
 
-> 当前稳定版：v0.7.3（新增自动低内存模式和 Windows 托盘）。
+> 当前稳定版：v0.7.4（修复 Agent CLI 中文输出编码，统一为 UTF-8）。
 
 ## 当前功能
 
@@ -94,37 +94,37 @@ python run_cli.py tree current --limit 20 --json
 
 发布包包含两个程序：
 
-- `disk-space-growth-monitor-v0.7.3.exe`：图形界面、自动模式、托盘和控制服务。
-- `diskmonitor-cli-v0.7.3.exe`：供用户、脚本或本地 Agent 调用的命令行客户端。
+- `disk-space-growth-monitor-v0.7.4.exe`：图形界面、自动模式、托盘和控制服务。
+- `diskmonitor-cli-v0.7.4.exe`：供用户、脚本或本地 Agent 调用的命令行客户端。
 
 常用操作：
 
 ```powershell
 # 幂等启动；GUI 已运行时不会抢窗口焦点
-.\diskmonitor-cli-v0.7.3.exe app start --json
+.\diskmonitor-cli-v0.7.4.exe app start --json
 
 # 明确切换模式；低内存模式会拒绝扫描
-.\diskmonitor-cli-v0.7.3.exe mode set low_memory --json
-.\diskmonitor-cli-v0.7.3.exe mode set full --rescan now --json
+.\diskmonitor-cli-v0.7.4.exe mode set low_memory --json
+.\diskmonitor-cli-v0.7.4.exe mode set full --rescan now --json
 
 # 启动扫描后，用响应中的 request_id 等待或读取结果
-.\diskmonitor-cli-v0.7.3.exe scan start "D:\data" --json
-.\diskmonitor-cli-v0.7.3.exe scan wait --request-id REQUEST_ID --json
+.\diskmonitor-cli-v0.7.4.exe scan start "D:\data" --json
+.\diskmonitor-cli-v0.7.4.exe scan wait --request-id REQUEST_ID --json
 
 # Agent 导航和数据读取
-.\diskmonitor-cli-v0.7.3.exe view open "D:\data\logs" --scan-if-missing --json
-.\diskmonitor-cli-v0.7.3.exe growth current --limit 20 --json
-.\diskmonitor-cli-v0.7.3.exe snapshot list --limit 20 --json
-.\diskmonitor-cli-v0.7.3.exe session last --json
+.\diskmonitor-cli-v0.7.4.exe view open "D:\data\logs" --scan-if-missing --json
+.\diskmonitor-cli-v0.7.4.exe growth current --limit 20 --json
+.\diskmonitor-cli-v0.7.4.exe snapshot list --limit 20 --json
+.\diskmonitor-cli-v0.7.4.exe session last --json
 ```
 
-所有响应都带协议版本、状态码、请求编号和 UTC 响应时间。扫描是异步任务；CLI 不会静默切换模式。控制接口只有白名单操作，不支持删除文件、执行任意命令或远程网络访问。认证密钥不会写入 JSON 响应或日志。
+所有响应都带协议版本、状态码、请求编号和 UTC 响应时间。CLI 的标准输出和标准错误统一使用 UTF-8，包含中文的 `--json` 响应可直接按 UTF-8 解码。扫描是异步任务；CLI 不会静默切换模式。控制接口只有白名单操作，不支持删除文件、执行任意命令或远程网络访问。认证密钥不会写入 JSON 响应或日志。
 
 自动模式也可由 Agent 配置：
 
 ```powershell
-.\diskmonitor-cli-v0.7.3.exe automation status --json
-.\diskmonitor-cli-v0.7.3.exe automation configure `
+.\diskmonitor-cli-v0.7.4.exe automation status --json
+.\diskmonitor-cli-v0.7.4.exe automation configure `
     --enabled on `
     --processes "r5apex.exe;cs2.exe" `
     --memory-pressure on `
@@ -177,8 +177,8 @@ python -m pip install -r requirements-build.txt
 
 `build.ps1` 是唯一打包配置源，显式关闭 UPX；PyInstaller 自动生成的
 `.spec` 属于临时产物，不纳入版本控制。生成的程序位于
-`dist/disk-space-growth-monitor-v0.7.3.exe` 和
-`dist/diskmonitor-cli-v0.7.3.exe`。
+`dist/disk-space-growth-monitor-v0.7.4.exe` 和
+`dist/diskmonitor-cli-v0.7.4.exe`。
 
 ## 已知边界
 

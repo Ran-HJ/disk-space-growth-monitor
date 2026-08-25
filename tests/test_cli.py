@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -167,6 +170,33 @@ class CliTests(unittest.TestCase):
                 "resume_rescan": "later",
             },
         )
+
+    def test_json_stdout_is_utf8_when_parent_requests_gbk(self) -> None:
+        project_root = Path(__file__).resolve().parents[1]
+        environment = os.environ.copy()
+        environment["PYTHONIOENCODING"] = "gbk"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            environment["LOCALAPPDATA"] = temp_dir
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(project_root / "run_cli.py"),
+                    "app",
+                    "status",
+                    "--json",
+                ],
+                cwd=project_root,
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        output = completed.stdout.decode("utf-8")
+        response = json.loads(output)
+        self.assertEqual(response["message"], "GUI 未运行")
+        self.assertEqual(completed.stderr, b"")
 
 
 if __name__ == "__main__":
