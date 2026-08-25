@@ -6,6 +6,7 @@ import sqlite3
 from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 from disk_monitor.models import DiskSample, ScanItem, ScanResult
 from disk_monitor.storage import Storage
@@ -30,6 +31,29 @@ def make_result(root: str, size: int) -> ScanResult:
 
 
 class StorageTests(unittest.TestCase):
+    def test_new_database_records_schema_version(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "test.db"
+
+            Storage(database_path)
+
+            with closing(sqlite3.connect(database_path)) as connection:
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+            self.assertEqual(version, 1)
+
+    def test_database_newer_than_supported_schema_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "future.db"
+            with closing(sqlite3.connect(database_path)) as connection:
+                connection.execute("PRAGMA user_version = 99")
+
+            with self.assertRaisesRegex(RuntimeError, "数据库版本"):
+                Storage(database_path)
+
+            with closing(sqlite3.connect(database_path)) as connection:
+                journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+            self.assertEqual(journal_mode, "delete")
+
     def test_disk_samples_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             storage = Storage(Path(temp_dir) / "test.db")
@@ -157,8 +181,10 @@ class StorageTests(unittest.TestCase):
                     row[1]
                     for row in connection.execute("PRAGMA table_info(snapshots)")
                 }
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
             self.assertIn("note", columns)
             self.assertIn("source", columns)
+            self.assertEqual(version, 1)
 
     def test_snapshot_history_uses_reference_source_priority(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -309,6 +335,34 @@ class StorageTests(unittest.TestCase):
             self.assertIsNotNone(session)
             assert session is not None
             self.assertEqual(session.end_reason, "normal_close")
+
+    def test_finish_session_returns_growth_without_opening_a_second_connection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir) / "test.db")
+            root = str(Path(temp_dir) / "root")
+            sample = DiskSample(datetime.now(), "C:\\", 1000, 400, 600)
+            start_id = storage.save_scan(make_result(root, 10))
+            end_id = storage.save_scan(make_result(root, 20))
+            session_id = storage.start_session(sample, root)
+            storage.set_session_start_snapshot(session_id, start_id)
+            original_connect = storage._connect
+            connect_count = 0
+
+            def counted_connect():
+                nonlocal connect_count
+                connect_count += 1
+                return original_connect()
+
+            with patch.object(storage, "_connect", side_effect=counted_connect):
+                growth = storage.finish_session(
+                    session_id,
+                    sample,
+                    end_snapshot_id=end_id,
+                    end_reason="normal_close",
+                )
+
+            self.assertEqual(connect_count, 1)
+            self.assertTrue(growth)
 
     def test_unfinished_session_is_recovered_on_next_start(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

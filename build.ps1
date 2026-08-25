@@ -11,6 +11,7 @@ $buildPython = if (Test-Path -LiteralPath ".venv\Scripts\python.exe") {
     --clean `
     --windowed `
     --onefile `
+    --noupx `
     --version-file "version_info.txt" `
     --icon "assets\app.ico" `
     --add-data "assets\app.ico;assets" `

@@ -5,6 +5,7 @@ import os
 import stat
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import datetime
 from itertools import count
 
@@ -24,6 +25,26 @@ ProgressCallback = Callable[[ScanProgress], None]
 
 class ScanCancelled(Exception):
     """扫描被用户取消。"""
+
+
+@dataclass
+class _DirectoryFrame:
+    directory: str
+    depth: int
+    name: str
+    parent: _DirectoryFrame | None = None
+    total_size: int = 0
+    file_count: int = 0
+    directory_count: int = 1
+    error_count: int = 0
+    latest_modified: float = 0.0
+    direct_file_bytes: int = 0
+    direct_file_count: int = 0
+    directory_children: list[NavigationItem] = field(default_factory=list)
+    navigation_file_slots: int = 0
+    navigation_files: list[tuple[int, int, str, float]] = field(
+        default_factory=list
+    )
 
 
 def _is_reparse_point(file_stat: os.stat_result) -> bool:
@@ -117,122 +138,102 @@ def scan_path(
         navigation_reserved_slots -= reserved
         navigation_committed_slots += used
 
-    def walk(directory: str, depth: int) -> tuple[int, int, int, int, float]:
+    root_frame = _DirectoryFrame(
+        directory=root,
+        depth=0,
+        name=os.path.basename(root.rstrip("\\/")) or root,
+    )
+    stack: list[tuple[str, _DirectoryFrame]] = [("enter", root_frame)]
+    while stack:
         if cancel.is_set():
             raise ScanCancelled
-
-        normalized_directory = os.path.normcase(os.path.abspath(directory))
-        total_size = 0
-        file_count = 0
-        directory_count = 1
-        error_count = 0
-        latest_modified = 0.0
-        direct_file_bytes = 0
-        direct_file_count = 0
-        directory_children: list[NavigationItem] = []
-        navigation_file_slots = reserve_navigation_slots()
-        navigation_files: list[tuple[int, int, str, float]] = []
-        counters["directories"] += 1
-
-        try:
-            with os.scandir(directory) as entries:
-                for entry in entries:
-                    if cancel.is_set():
-                        raise ScanCancelled
-                    try:
-                        entry_stat = entry.stat(follow_symlinks=False)
-                        if entry.is_symlink() or _is_reparse_point(entry_stat):
-                            continue
-
-                        if entry.is_dir(follow_symlinks=False):
-                            (
-                                child_size,
-                                child_files,
-                                child_directories,
-                                child_errors,
-                                child_modified,
-                            ) = walk(entry.path, depth + 1)
-                            total_size += child_size
-                            file_count += child_files
-                            directory_count += child_directories
-                            error_count += child_errors
-                            latest_modified = max(latest_modified, child_modified)
-                            directory_children.append(
-                                NavigationItem(
-                                    name=entry.name,
-                                    kind="directory",
-                                    size_bytes=child_size,
-                                    file_count=child_files,
-                                    modified_at=child_modified,
+        action, frame = stack.pop()
+        if action == "enter":
+            frame.navigation_file_slots = reserve_navigation_slots()
+            counters["directories"] += 1
+            stack.append(("exit", frame))
+            child_frames: list[_DirectoryFrame] = []
+            try:
+                with os.scandir(frame.directory) as entries:
+                    for entry in entries:
+                        if cancel.is_set():
+                            raise ScanCancelled
+                        try:
+                            entry_stat = entry.stat(follow_symlinks=False)
+                            if entry.is_symlink() or _is_reparse_point(entry_stat):
+                                continue
+                            if entry.is_dir(follow_symlinks=False):
+                                child_frames.append(
+                                    _DirectoryFrame(
+                                        directory=os.path.normcase(
+                                            os.path.abspath(entry.path)
+                                        ),
+                                        depth=frame.depth + 1,
+                                        name=entry.name,
+                                        parent=frame,
+                                    )
                                 )
-                            )
-                            if depth + 1 <= record_depth:
-                                child_path = os.path.normcase(os.path.abspath(entry.path))
-                                items[child_path] = ScanItem(
-                                    path=child_path,
-                                    parent_path=os.path.normcase(
-                                        os.path.abspath(directory)
-                                    ),
-                                    name=entry.name,
-                                    kind="directory",
-                                    size_bytes=child_size,
-                                    file_count=child_files,
-                                    depth=depth + 1,
-                                    modified_at=child_modified,
-                                )
-                        elif entry.is_file(follow_symlinks=False):
+                                continue
+                            if not entry.is_file(follow_symlinks=False):
+                                continue
                             size = entry_stat.st_size
                             modified = entry_stat.st_mtime
                             file_path = os.path.normcase(os.path.abspath(entry.path))
                             item = ScanItem(
                                 path=file_path,
-                                parent_path=os.path.normcase(
-                                    os.path.abspath(directory)
-                                ),
+                                parent_path=frame.directory,
                                 name=entry.name,
                                 kind="file",
                                 size_bytes=size,
                                 file_count=1,
-                                depth=depth + 1,
+                                depth=frame.depth + 1,
                                 modified_at=modified,
                             )
-                            if depth + 1 <= record_depth:
+                            if frame.depth + 1 <= record_depth:
                                 items[file_path] = item
                             remember_file(item)
-                            total_size += size
-                            file_count += 1
-                            direct_file_bytes += size
-                            direct_file_count += 1
-                            latest_modified = max(latest_modified, modified)
-                            if navigation_file_slots:
+                            frame.total_size += size
+                            frame.file_count += 1
+                            frame.direct_file_bytes += size
+                            frame.direct_file_count += 1
+                            frame.latest_modified = max(
+                                frame.latest_modified, modified
+                            )
+                            if frame.navigation_file_slots:
                                 navigation_entry = (
                                     size,
                                     next(navigation_sequence),
                                     entry.name,
                                     modified,
                                 )
-                                if len(navigation_files) < navigation_file_slots:
+                                if (
+                                    len(frame.navigation_files)
+                                    < frame.navigation_file_slots
+                                ):
                                     heapq.heappush(
-                                        navigation_files, navigation_entry
+                                        frame.navigation_files,
+                                        navigation_entry,
                                     )
-                                elif size > navigation_files[0][0]:
+                                elif size > frame.navigation_files[0][0]:
                                     heapq.heapreplace(
-                                        navigation_files, navigation_entry
+                                        frame.navigation_files,
+                                        navigation_entry,
                                     )
                             counters["bytes"] += size
                             counters["files"] += 1
                             counters["since_progress"] += 1
                             report(entry.path)
-                    except ScanCancelled:
-                        raise
-                    except (OSError, PermissionError):
-                        counters["errors"] += 1
-                        error_count += 1
-        except ScanCancelled:
-            raise
-        except (OSError, PermissionError):
-            counters["errors"] += 1
-            error_count += 1
+                        except OSError:
+                            counters["errors"] += 1
+                            frame.error_count += 1
+            except ScanCancelled:
+                raise
+            except OSError:
+                counters["errors"] += 1
+                frame.error_count += 1
+            for child_frame in reversed(child_frames):
+                stack.append(("enter", child_frame))
+            continue
 
         visible_files = [
             NavigationItem(
@@ -243,35 +244,55 @@ def scan_path(
                 modified_at=modified,
             )
             for size, _, name, modified in sorted(
-                navigation_files, reverse=True
+                frame.navigation_files, reverse=True
             )
         ]
-        commit_navigation_slots(navigation_file_slots, len(visible_files))
-        navigation_nodes[normalized_directory] = NavigationNode(
-            total_bytes=total_size,
-            file_count=file_count,
-            directory_count=directory_count,
-            error_count=error_count,
-            modified_at=latest_modified,
-            direct_file_bytes=direct_file_bytes,
-            direct_file_count=direct_file_count,
-            children=tuple(directory_children + visible_files),
+        commit_navigation_slots(frame.navigation_file_slots, len(visible_files))
+        navigation_nodes[frame.directory] = NavigationNode(
+            total_bytes=frame.total_size,
+            file_count=frame.file_count,
+            directory_count=frame.directory_count,
+            error_count=frame.error_count,
+            modified_at=frame.latest_modified,
+            direct_file_bytes=frame.direct_file_bytes,
+            direct_file_count=frame.direct_file_count,
+            children=tuple(frame.directory_children + visible_files),
         )
-        return (
-            total_size,
-            file_count,
-            directory_count,
-            error_count,
-            latest_modified,
-        )
+        if frame.parent is not None:
+            parent = frame.parent
+            parent.total_size += frame.total_size
+            parent.file_count += frame.file_count
+            parent.directory_count += frame.directory_count
+            parent.error_count += frame.error_count
+            parent.latest_modified = max(
+                parent.latest_modified, frame.latest_modified
+            )
+            parent.directory_children.append(
+                NavigationItem(
+                    name=frame.name,
+                    kind="directory",
+                    size_bytes=frame.total_size,
+                    file_count=frame.file_count,
+                    modified_at=frame.latest_modified,
+                )
+            )
+            if frame.depth <= record_depth:
+                items[frame.directory] = ScanItem(
+                    path=frame.directory,
+                    parent_path=parent.directory,
+                    name=frame.name,
+                    kind="directory",
+                    size_bytes=frame.total_size,
+                    file_count=frame.file_count,
+                    depth=frame.depth,
+                    modified_at=frame.latest_modified,
+                )
 
-    (
-        total_bytes,
-        total_files,
-        total_directories,
-        total_errors,
-        root_modified,
-    ) = walk(root, 0)
+    total_bytes = root_frame.total_size
+    total_files = root_frame.file_count
+    total_directories = root_frame.directory_count
+    total_errors = root_frame.error_count
+    root_modified = root_frame.latest_modified
     for _, _, item in top_files:
         items.setdefault(item.path, item)
 

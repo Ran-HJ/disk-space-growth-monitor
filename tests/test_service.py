@@ -11,6 +11,7 @@ from disk_monitor.service import (
     downsample_disk_samples,
     find_sample_gaps,
     nearest_disk_sample,
+    normalize_drive,
     split_sample_segments,
 )
 
@@ -20,6 +21,12 @@ def sample(used_bytes: int, recorded_at: datetime) -> DiskSample:
 
 
 class ServiceTests(unittest.TestCase):
+    def test_normalize_drive_preserves_unc_share_root(self) -> None:
+        self.assertEqual(
+            normalize_drive(r"\\server\share\folder"),
+            "\\\\server\\share\\",
+        )
+
     def test_blind_spot_requires_old_sample_and_strictly_exceeds_threshold(self) -> None:
         now = datetime.now()
         current = sample(500_000_000, now)

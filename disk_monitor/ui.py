@@ -3070,7 +3070,7 @@ class DiskMonitorApp:
             self.session_finished = True
         except Exception:
             # 进程退出或系统关机阶段不再弹窗；未完成会话将在下次启动补记。
-            pass
+            self.logger.exception("process_exit_finalize_failed")
 
     def _on_close(self) -> None:
         if self.closing:

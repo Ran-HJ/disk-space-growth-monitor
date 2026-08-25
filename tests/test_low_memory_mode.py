@@ -7,7 +7,7 @@ import unittest
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from disk_monitor.models import DiskSample
 from disk_monitor.scanner import scan_path
@@ -53,6 +53,23 @@ def later_sample(sample: DiskSample, change_bytes: int) -> DiskSample:
 
 
 class LowMemoryModeTests(unittest.TestCase):
+    def test_process_exit_failure_is_logged_and_left_for_recovery(self) -> None:
+        app = object.__new__(DiskMonitorApp)
+        app.session_id = 1
+        app.session_finished = False
+        app.session_root_path = "C:\\"
+        app.storage = Mock()
+        app.logger = Mock()
+
+        with patch(
+            "disk_monitor.ui.read_disk_sample",
+            side_effect=RuntimeError("injected process-exit failure"),
+        ):
+            app._finalize_on_process_exit()
+
+        app.logger.exception.assert_called_once_with("process_exit_finalize_failed")
+        self.assertFalse(app.session_finished)
+
     def test_mode_switch_waits_for_first_sample(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
@@ -199,6 +216,41 @@ class LowMemoryModeTests(unittest.TestCase):
                 self.assertIsNone(session.start_snapshot_id)
                 self.assertIsNone(session.end_snapshot_id)
                 self.assertEqual(storage.list_snapshots(limit=10), [])
+            finally:
+                app.session_finished = True
+                try:
+                    app._destroy_root()
+                except tk.TclError:
+                    pass
+
+    def test_low_memory_close_waits_for_residual_scan_cancellation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            scan_root = base / "scan-root"
+            scan_root.mkdir()
+            storage = Storage(base / "monitor.db")
+            storage.set_setting("run_mode", RUN_MODE_LOW_MEMORY)
+            root = tk.Tk()
+            root.withdraw()
+            app = DiskMonitorApp(root, storage=storage, initial_path=str(scan_root))
+            try:
+                pump_until(root, lambda: app.session_id is not None)
+                app.cancel_event.clear()
+                app.active_scan_role = "manual"
+                app.scan_thread = SimpleNamespace(
+                    is_alive=lambda: not app.cancel_event.is_set()
+                )
+
+                app._on_close()
+
+                self.assertTrue(app.cancel_event.is_set())
+                self.assertTrue(root.winfo_exists())
+                app.messages.put(("scan_cancelled", "manual"))
+                wait_for_destroy(root)
+                session = storage.latest_completed_session()
+                self.assertIsNotNone(session)
+                assert session is not None
+                self.assertEqual(session.end_reason, "low_memory_close")
             finally:
                 app.session_finished = True
                 try:

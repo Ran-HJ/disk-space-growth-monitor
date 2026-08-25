@@ -26,6 +26,8 @@ SNAPSHOT_SOURCES = {
     "manual_save",
 }
 
+CURRENT_SCHEMA_VERSION = 1
+
 
 def default_database_path() -> Path:
     base = Path(os.environ.get("LOCALAPPDATA", Path.home()))
@@ -55,6 +57,19 @@ class Storage:
             connection.close()
 
     def _initialize(self) -> None:
+        probe = sqlite3.connect(self.database_path, timeout=30)
+        try:
+            schema_version = int(
+                probe.execute("PRAGMA user_version").fetchone()[0]
+            )
+        finally:
+            probe.close()
+        if schema_version > CURRENT_SCHEMA_VERSION:
+            raise RuntimeError(
+                "数据库版本高于当前程序支持的版本："
+                f"{schema_version} > {CURRENT_SCHEMA_VERSION}"
+            )
+
         with self._connection() as connection:
             connection.executescript(
                 """
@@ -144,6 +159,7 @@ class Storage:
                 connection.execute("ALTER TABLE snapshots ADD COLUMN note TEXT")
             if "source" not in snapshot_columns:
                 connection.execute("ALTER TABLE snapshots ADD COLUMN source TEXT")
+            connection.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
 
     def add_disk_sample(self, sample: DiskSample) -> None:
         with self._connection() as connection:
@@ -656,31 +672,36 @@ class Storage:
         end_reason: str,
     ) -> list[GrowthItem]:
         with self._connection() as connection:
-            session = connection.execute(
+            cursor = connection.execute(
                 """
-                SELECT status, start_snapshot_id
-                FROM monitor_sessions WHERE id = ?
+                UPDATE monitor_sessions
+                SET ended_at = ?, end_used_bytes = ?, end_snapshot_id = ?,
+                    end_reason = ?, status = 'completed'
+                WHERE id = ? AND status = 'active'
                 """,
-                (session_id,),
-            ).fetchone()
-            if session is None:
-                raise ValueError(f"监控会话不存在：{session_id}")
-            if session["status"] == "active":
-                connection.execute(
+                (
+                    sample.recorded_at.isoformat(timespec="seconds"),
+                    sample.used_bytes,
+                    end_snapshot_id,
+                    end_reason,
+                    session_id,
+                ),
+            )
+            if cursor.rowcount == 0:
+                exists = connection.execute(
+                    "SELECT 1 FROM monitor_sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if exists is None:
+                    raise ValueError(f"监控会话不存在：{session_id}")
+            else:
+                session = connection.execute(
                     """
-                    UPDATE monitor_sessions
-                    SET ended_at = ?, end_used_bytes = ?, end_snapshot_id = ?,
-                        end_reason = ?, status = 'completed'
-                    WHERE id = ?
+                    SELECT start_snapshot_id
+                    FROM monitor_sessions WHERE id = ?
                     """,
-                    (
-                        sample.recorded_at.isoformat(timespec="seconds"),
-                        sample.used_bytes,
-                        end_snapshot_id,
-                        end_reason,
-                        session_id,
-                    ),
-                )
+                    (session_id,),
+                ).fetchone()
                 start_snapshot_id = session["start_snapshot_id"]
                 if start_snapshot_id is not None and end_snapshot_id is not None:
                     connection.execute(
@@ -722,7 +743,7 @@ class Storage:
                             start_snapshot_id,
                         ),
                     )
-        return self.get_session_growth(session_id)
+            return self._get_session_growth(connection, session_id, 100, "increase")
 
     def recover_active_sessions(self, sample: DiskSample) -> int:
         """在下次启动时为未正常结束的会话补记最终磁盘用量。"""
@@ -751,20 +772,31 @@ class Storage:
         *,
         direction: str = "increase",
     ) -> list[GrowthItem]:
+        with self._connection() as connection:
+            return self._get_session_growth(
+                connection, session_id, limit, direction
+            )
+
+    @staticmethod
+    def _get_session_growth(
+        connection: sqlite3.Connection,
+        session_id: int,
+        limit: int,
+        direction: str,
+    ) -> list[GrowthItem]:
         if direction not in {"increase", "decrease"}:
             raise ValueError("direction 必须是 increase 或 decrease")
         comparator = ">" if direction == "increase" else "<"
-        with self._connection() as connection:
-            rows = connection.execute(
-                f"""
-                SELECT path, name, kind, old_size_bytes, new_size_bytes
-                FROM session_growth_items
-                WHERE session_id = ? AND change_bytes {comparator} 0
-                ORDER BY ABS(change_bytes) DESC
-                LIMIT ?
-                """,
-                (session_id, limit),
-            ).fetchall()
+        rows = connection.execute(
+            f"""
+            SELECT path, name, kind, old_size_bytes, new_size_bytes
+            FROM session_growth_items
+            WHERE session_id = ? AND change_bytes {comparator} 0
+            ORDER BY ABS(change_bytes) DESC
+            LIMIT ?
+            """,
+            (session_id, limit),
+        ).fetchall()
         return [
             GrowthItem(
                 path=row["path"],

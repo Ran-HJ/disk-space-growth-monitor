@@ -4,6 +4,8 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from disk_monitor.navigation import (
     enforce_skeleton_budget,
@@ -14,6 +16,65 @@ from disk_monitor.scanner import scan_path
 
 
 class ScannerTests(unittest.TestCase):
+    def test_scan_handles_directory_depth_beyond_python_recursion_limit(self) -> None:
+        root = os.path.normcase(os.path.abspath("virtual-root"))
+        depths = {root: 0}
+        target_depth = 1_100
+
+        class FakeEntry:
+            def __init__(self, parent: str, name: str, *, is_directory: bool) -> None:
+                self.name = name
+                self.path = os.path.join(parent, name)
+                self._is_directory = is_directory
+
+            def stat(self, *, follow_symlinks: bool = False):
+                del follow_symlinks
+                return SimpleNamespace(
+                    st_file_attributes=0,
+                    st_size=7,
+                    st_mtime=1.0,
+                )
+
+            def is_symlink(self) -> bool:
+                return False
+
+            def is_dir(self, *, follow_symlinks: bool = False) -> bool:
+                del follow_symlinks
+                return self._is_directory
+
+            def is_file(self, *, follow_symlinks: bool = False) -> bool:
+                del follow_symlinks
+                return not self._is_directory
+
+        class FakeScandir:
+            def __init__(self, entries) -> None:
+                self.entries = entries
+
+            def __enter__(self):
+                return iter(self.entries)
+
+            def __exit__(self, exc_type, exc_value, traceback) -> None:
+                del exc_type, exc_value, traceback
+
+        def fake_scandir(directory: str):
+            normalized = os.path.normcase(os.path.abspath(directory))
+            depth = depths[normalized]
+            if depth < target_depth:
+                entry = FakeEntry(normalized, "d", is_directory=True)
+                depths[os.path.normcase(os.path.abspath(entry.path))] = depth + 1
+                return FakeScandir([entry])
+            return FakeScandir([FakeEntry(normalized, "leaf.bin", is_directory=False)])
+
+        with patch("disk_monitor.scanner.os.path.isdir", return_value=True), patch(
+            "disk_monitor.scanner.os.scandir", side_effect=fake_scandir
+        ):
+            result = scan_path(root, record_depth=1)
+
+        self.assertEqual(result.total_bytes, 7)
+        self.assertEqual(result.file_count, 1)
+        self.assertEqual(result.directory_count, target_depth + 1)
+        self.assertEqual(result.error_count, 0)
+
     def test_scan_aggregates_files_and_directories(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
