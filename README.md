@@ -2,7 +2,7 @@
 
 这是一个面向 Windows 的磁盘空间监控工具。全功能模式通过启动和关闭目录快照定位空间变化；低内存模式只保留磁盘容量采样、趋势和历史快照查看，适合游戏等需要让出内存的场景。
 
-> 当前稳定版：v0.7.4（修复 Agent CLI 中文输出编码，统一为 UTF-8）。
+> 当前稳定版：v0.7.5（托盘独立设置窗口与 Windows 高 DPI 清晰度优化）。
 
 ## 当前功能
 
@@ -58,6 +58,8 @@
 - 只有自动进入的低内存才会自动恢复；用户或 Agent 的人工选择始终优先
 - 自动恢复默认不立即扫盘，避免游戏刚结束就产生磁盘负载；可在设置中改为立即补扫
 - Windows 托盘显示当前模式和自动状态，可显示/隐藏窗口、切换模式、扫描、打开设置或退出
+- 从托盘打开设置时只显示独立的小型设置窗口，不再同时恢复主界面；重复打开会聚焦同一个窗口
+- GUI 使用 Windows Per-Monitor V2 DPI 感知，并让窗口尺寸、字体与表格行高跟随显示器缩放，减少高 DPI 下的模糊和裁切
 
 ## 直接运行
 
@@ -94,28 +96,28 @@ python run_cli.py tree current --limit 20 --json
 
 发布包包含两个程序：
 
-- `disk-space-growth-monitor-v0.7.4.exe`：图形界面、自动模式、托盘和控制服务。
-- `diskmonitor-cli-v0.7.4.exe`：供用户、脚本或本地 Agent 调用的命令行客户端。
+- `disk-space-growth-monitor-v0.7.5.exe`：图形界面、自动模式、托盘和控制服务。
+- `diskmonitor-cli-v0.7.5.exe`：供用户、脚本或本地 Agent 调用的命令行客户端。
 
 常用操作：
 
 ```powershell
 # 幂等启动；GUI 已运行时不会抢窗口焦点
-.\diskmonitor-cli-v0.7.4.exe app start --json
+.\diskmonitor-cli-v0.7.5.exe app start --json
 
 # 明确切换模式；低内存模式会拒绝扫描
-.\diskmonitor-cli-v0.7.4.exe mode set low_memory --json
-.\diskmonitor-cli-v0.7.4.exe mode set full --rescan now --json
+.\diskmonitor-cli-v0.7.5.exe mode set low_memory --json
+.\diskmonitor-cli-v0.7.5.exe mode set full --rescan now --json
 
 # 启动扫描后，用响应中的 request_id 等待或读取结果
-.\diskmonitor-cli-v0.7.4.exe scan start "D:\data" --json
-.\diskmonitor-cli-v0.7.4.exe scan wait --request-id REQUEST_ID --json
+.\diskmonitor-cli-v0.7.5.exe scan start "D:\data" --json
+.\diskmonitor-cli-v0.7.5.exe scan wait --request-id REQUEST_ID --json
 
 # Agent 导航和数据读取
-.\diskmonitor-cli-v0.7.4.exe view open "D:\data\logs" --scan-if-missing --json
-.\diskmonitor-cli-v0.7.4.exe growth current --limit 20 --json
-.\diskmonitor-cli-v0.7.4.exe snapshot list --limit 20 --json
-.\diskmonitor-cli-v0.7.4.exe session last --json
+.\diskmonitor-cli-v0.7.5.exe view open "D:\data\logs" --scan-if-missing --json
+.\diskmonitor-cli-v0.7.5.exe growth current --limit 20 --json
+.\diskmonitor-cli-v0.7.5.exe snapshot list --limit 20 --json
+.\diskmonitor-cli-v0.7.5.exe session last --json
 ```
 
 所有响应都带协议版本、状态码、请求编号和 UTC 响应时间。CLI 的标准输出和标准错误统一使用 UTF-8，包含中文的 `--json` 响应可直接按 UTF-8 解码。扫描是异步任务；CLI 不会静默切换模式。控制接口只有白名单操作，不支持删除文件、执行任意命令或远程网络访问。认证密钥不会写入 JSON 响应或日志。
@@ -123,8 +125,8 @@ python run_cli.py tree current --limit 20 --json
 自动模式也可由 Agent 配置：
 
 ```powershell
-.\diskmonitor-cli-v0.7.4.exe automation status --json
-.\diskmonitor-cli-v0.7.4.exe automation configure `
+.\diskmonitor-cli-v0.7.5.exe automation status --json
+.\diskmonitor-cli-v0.7.5.exe automation configure `
     --enabled on `
     --processes "r5apex.exe;cs2.exe" `
     --memory-pressure on `
@@ -154,7 +156,7 @@ python run_cli.py tree current --limit 20 --json
 14. 点击标题栏“切换低内存模式”可立即释放扫描数据；扫描进行中时需等待结束或先取消扫描。
 15. 从低内存切回全功能时，“是”会立即补扫，“否”只恢复扫描按钮，“取消”保持低内存模式。
 16. 在“设置”中启用自动低内存模式，填写要监控的游戏进程，并按需要调整内存阈值和恢复补扫策略。
-17. 托盘图标右键菜单可显示或隐藏窗口、查看自动状态、手动切换模式、重新扫描或选择退出方式；窗口关闭按钮仍沿用原有关闭设置。
+17. 托盘图标右键菜单可显示或隐藏窗口、查看自动状态、手动切换模式、重新扫描或选择退出方式；从托盘进入“设置”只显示独立设置窗口，窗口关闭按钮仍沿用原有关闭设置。
 
 ## v0.7.0 内存目标与实测
 
@@ -177,8 +179,9 @@ python -m pip install -r requirements-build.txt
 
 `build.ps1` 是唯一打包配置源，显式关闭 UPX；PyInstaller 自动生成的
 `.spec` 属于临时产物，不纳入版本控制。生成的程序位于
-`dist/disk-space-growth-monitor-v0.7.4.exe` 和
-`dist/diskmonitor-cli-v0.7.4.exe`。
+`dist/disk-space-growth-monitor-v0.7.5.exe` 和
+`dist/diskmonitor-cli-v0.7.5.exe`。GUI 构建会嵌入 Per-Monitor V2 DPI
+manifest；运行时也会同步 Tk 的字体缩放，以适配多显示器缩放。
 
 ## 已知边界
 

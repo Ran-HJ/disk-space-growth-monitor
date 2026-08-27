@@ -42,6 +42,60 @@ def control_request(
 
 
 class AutoModeUiTests(unittest.TestCase):
+    def test_tray_settings_stays_independent_and_single_instance(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            scan_root = base / "scan-root"
+            scan_root.mkdir()
+            storage = Storage(base / "monitor.db")
+            root = tk.Tk()
+            root.withdraw()
+            app = DiskMonitorApp(root, storage=storage, initial_path=str(scan_root))
+            try:
+                app._handle_tray_command("settings")
+                root.update()
+                first_window = app.settings_window
+
+                self.assertEqual(root.state(), "withdrawn")
+                self.assertIsNotNone(first_window)
+                assert first_window is not None
+                self.assertTrue(first_window.winfo_exists())
+
+                app._handle_tray_command("settings")
+                root.update()
+                self.assertIs(app.settings_window, first_window)
+                self.assertTrue(first_window.bind("<Return>"))
+
+                first_window.event_generate("<Escape>")
+                root.update()
+                self.assertIsNone(app.settings_window)
+                self.assertEqual(root.state(), "withdrawn")
+            finally:
+                app.session_finished = True
+                app._destroy_root()
+
+    def test_ui_fonts_and_tree_rows_follow_shared_typography(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            scan_root = base / "scan-root"
+            scan_root.mkdir()
+            storage = Storage(base / "monitor.db")
+            root = tk.Tk()
+            root.withdraw()
+            app = DiskMonitorApp(root, storage=storage, initial_path=str(scan_root))
+            try:
+                body_font = app.fonts["body"].actual()
+                self.assertEqual(body_font["family"], "Microsoft YaHei UI")
+                self.assertEqual(body_font["size"], 10)
+                row_height = int(app.style.lookup("Treeview", "rowheight"))
+                self.assertGreaterEqual(
+                    row_height,
+                    int(app.fonts["caption"].metrics("linespace")) + 10,
+                )
+            finally:
+                app.session_finished = True
+                app._destroy_root()
+
     def test_tray_commands_are_applied_by_the_gui_message_loop(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)

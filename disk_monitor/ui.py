@@ -8,6 +8,7 @@ import queue
 import sys
 import threading
 import tkinter as tk
+import tkinter.font as tkfont
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -56,6 +57,13 @@ from .service import (
 )
 from .storage import Storage
 from .tray import TrayState, WindowsTrayIcon
+from .windows_display import (
+    DisplayMetrics,
+    cursor_work_area,
+    enable_per_monitor_dpi_awareness,
+    position_near_cursor,
+    sync_tk_scaling,
+)
 
 
 COLORS = {
@@ -120,7 +128,7 @@ class CloseChoiceDialog:
         ttk.Label(
             body,
             text="如何保存本次监控会话？",
-            font=("Microsoft YaHei UI", 11, "bold"),
+            style="SectionBackground.TLabel",
         ).pack(anchor=tk.W)
         ttk.Label(
             body,
@@ -295,6 +303,9 @@ class DiskMonitorApp:
         self.automation_after_id: str | None = None
         self.treemap_animation_after_id: str | None = None
         self.treemap_resize_after_id: str | None = None
+        self.display_after_id: str | None = None
+        self.display_sync_window: tk.Misc | None = None
+        self.settings_window: tk.Toplevel | None = None
         self.nav_stack = self._path_chain(requested_path)
         self.nav_cache: dict[str, ScanResult] = {}
         self.nav_invalidated_roots: set[str] = set()
@@ -333,6 +344,9 @@ class DiskMonitorApp:
         self.last_scan_summary = "尚无数据"
         self.treemap_placeholder_text = "点击“重新扫描当前目录”生成空间分布图"
 
+        self.display_metrics: DisplayMetrics = sync_tk_scaling(self.root)
+        self.ui_scale = self.display_metrics.dpi / 96
+        self._configure_fonts()
         self._configure_window()
         self._configure_styles()
         self._build_ui()
@@ -344,6 +358,12 @@ class DiskMonitorApp:
             __version__,
             requested_path,
             self.run_mode,
+        )
+        self.logger.info(
+            "display_config dpi=%s tk_scaling=%.4f changed=%s",
+            self.display_metrics.dpi,
+            self.display_metrics.target_scaling,
+            self.display_metrics.changed,
         )
         self.poll_after_id = self.root.after(100, self._poll_messages)
         self.sample_after_id = self.root.after(200, self._sample_now)
@@ -461,10 +481,7 @@ class DiskMonitorApp:
             if self.run_mode == RUN_MODE_FULL:
                 self._refresh_current_path()
         elif command == "settings":
-            self.root.deiconify()
-            self.root.state("normal")
-            self.root.lift()
-            self._open_settings()
+            self._open_settings(from_tray=True)
         elif command == "exit_quick":
             self._request_controlled_close("quick")
         elif command == "exit_full":
@@ -696,8 +713,27 @@ class DiskMonitorApp:
 
     def _configure_window(self) -> None:
         self.root.title("C 盘空间增长监控器")
-        self.root.geometry("1180x780")
-        self.root.minsize(900, 680)
+        cursor = cursor_work_area()
+        if cursor is None:
+            work_left = 0
+            work_top = 0
+            work_width = self.root.winfo_screenwidth()
+            work_height = self.root.winfo_screenheight()
+        else:
+            _cursor_x, _cursor_y, work_area = cursor
+            work_left = work_area.left
+            work_top = work_area.top
+            work_width = work_area.right - work_area.left
+            work_height = work_area.bottom - work_area.top
+        edge_margin = self._px(24)
+        width = min(self._px(1180), max(self._px(900), work_width - edge_margin))
+        height = min(self._px(780), max(self._px(720), work_height - edge_margin))
+        minimum_width = min(self._px(900), width)
+        minimum_height = min(self._px(720), height)
+        x = work_left + max(0, (work_width - width) // 2)
+        y = work_top + max(0, (work_height - height) // 2)
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
+        self.root.minsize(minimum_width, minimum_height)
         self.root.configure(bg=COLORS["background"])
         bundle_root = Path(
             getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent)
@@ -708,52 +744,194 @@ class DiskMonitorApp:
             self.root.iconbitmap(default=str(icon_path))
         self.root.bind("<Map>", self._on_window_visibility_changed, add="+")
         self.root.bind("<Unmap>", self._on_window_visibility_changed, add="+")
+        self.root.bind("<Configure>", self._schedule_display_sync, add="+")
+
+    def _px(self, value: int) -> int:
+        return max(1, round(value * self.ui_scale))
+
+    def _configure_fonts(self) -> None:
+        family = "Microsoft YaHei UI"
+        for name, size, weight in (
+            ("TkDefaultFont", 10, "normal"),
+            ("TkTextFont", 10, "normal"),
+            ("TkMenuFont", 10, "normal"),
+            ("TkCaptionFont", 10, "normal"),
+            ("TkSmallCaptionFont", 9, "normal"),
+            ("TkHeadingFont", 10, "bold"),
+            ("TkIconFont", 10, "normal"),
+            ("TkTooltipFont", 9, "normal"),
+        ):
+            try:
+                tkfont.nametofont(name, root=self.root).configure(
+                    family=family,
+                    size=size,
+                    weight=weight,
+                )
+            except tk.TclError:
+                continue
+        self.fonts = {
+            "title": tkfont.Font(
+                root=self.root, family=family, size=18, weight="bold"
+            ),
+            "dialog_title": tkfont.Font(
+                root=self.root, family=family, size=15, weight="bold"
+            ),
+            "section": tkfont.Font(
+                root=self.root, family=family, size=11, weight="bold"
+            ),
+            "subheading": tkfont.Font(
+                root=self.root, family=family, size=10, weight="bold"
+            ),
+            "body": tkfont.Font(root=self.root, family=family, size=10),
+            "body_emphasis": tkfont.Font(
+                root=self.root, family=family, size=11
+            ),
+            "caption": tkfont.Font(root=self.root, family=family, size=9),
+            "caption_bold": tkfont.Font(
+                root=self.root, family=family, size=9, weight="bold"
+            ),
+            "tiny": tkfont.Font(root=self.root, family=family, size=8),
+            "tiny_bold": tkfont.Font(
+                root=self.root, family=family, size=8, weight="bold"
+            ),
+            "metric": tkfont.Font(
+                root=self.root, family=family, size=16, weight="bold"
+            ),
+        }
+
+    def _schedule_display_sync(self, event: tk.Event | None = None) -> None:
+        if event is not None:
+            if event.widget not in {self.root, self.settings_window}:
+                return
+            self.display_sync_window = event.widget
+        if self.display_after_id is not None:
+            return
+        try:
+            self.display_after_id = self.root.after(150, self._sync_display_scaling)
+        except tk.TclError:
+            self.display_after_id = None
+
+    def _sync_display_scaling(self) -> None:
+        self.display_after_id = None
+        window = self.display_sync_window or self.root
+        self.display_sync_window = None
+        try:
+            metrics = sync_tk_scaling(window)
+        except tk.TclError:
+            return
+        if not metrics.changed:
+            self.display_metrics = metrics
+            return
+        previous = self.display_metrics
+        self.display_metrics = metrics
+        self.ui_scale = metrics.dpi / 96
+        self._update_scaled_style_metrics()
+        self.logger.info(
+            "display_dpi_changed old_dpi=%s new_dpi=%s tk_scaling=%.4f",
+            previous.dpi,
+            metrics.dpi,
+            metrics.target_scaling,
+        )
+
+    def _update_scaled_style_metrics(self) -> None:
+        row_height = max(
+            self._px(27),
+            int(self.fonts["caption"].metrics("linespace")) + self._px(5),
+        )
+        self.style.configure("Treeview", rowheight=row_height)
 
     def _configure_styles(self) -> None:
         style = ttk.Style()
+        self.style = style
         if "vista" in style.theme_names():
             style.theme_use("vista")
         style.configure("TFrame", background=COLORS["background"])
         style.configure("Panel.TFrame", background=COLORS["panel"])
         style.configure(
+            "TLabel",
+            background=COLORS["background"],
+            foreground=COLORS["text"],
+            font=self.fonts["body"],
+        )
+        style.configure(
+            "TButton",
+            padding=(self._px(10), self._px(5)),
+            font=self.fonts["body"],
+        )
+        style.configure(
+            "TNotebook.Tab",
+            padding=(self._px(14), self._px(7)),
+            font=self.fonts["body"],
+        )
+        style.configure(
+            "Panel.TCheckbutton",
+            background=COLORS["panel"],
+            font=self.fonts["body"],
+        )
+        style.configure(
             "Title.TLabel",
             background=COLORS["background"],
             foreground=COLORS["text"],
-            font=("Microsoft YaHei UI", 18, "bold"),
+            font=self.fonts["title"],
+        )
+        style.configure(
+            "DialogTitle.TLabel",
+            background=COLORS["background"],
+            foreground=COLORS["text"],
+            font=self.fonts["dialog_title"],
+        )
+        style.configure(
+            "Section.TLabel",
+            background=COLORS["panel"],
+            foreground=COLORS["text"],
+            font=self.fonts["section"],
+        )
+        style.configure(
+            "SectionBackground.TLabel",
+            background=COLORS["background"],
+            foreground=COLORS["text"],
+            font=self.fonts["section"],
+        )
+        style.configure(
+            "PanelMuted.TLabel",
+            background=COLORS["panel"],
+            foreground=COLORS["muted"],
+            font=self.fonts["caption"],
         )
         style.configure(
             "Subtitle.TLabel",
             background=COLORS["background"],
             foreground=COLORS["muted"],
-            font=("Microsoft YaHei UI", 9),
+            font=self.fonts["caption"],
         )
         style.configure(
             "MetricName.TLabel",
             background=COLORS["panel"],
             foreground=COLORS["muted"],
-            font=("Microsoft YaHei UI", 9),
+            font=self.fonts["caption"],
         )
         style.configure(
             "MetricValue.TLabel",
             background=COLORS["panel"],
             foreground=COLORS["text"],
-            font=("Microsoft YaHei UI", 16, "bold"),
+            font=self.fonts["metric"],
         )
         style.configure(
             "ChangeIncrease.TLabel",
             background=COLORS["panel"],
             foreground=COLORS["positive"],
-            font=("Microsoft YaHei UI", 16, "bold"),
+            font=self.fonts["metric"],
         )
         style.configure(
             "ChangeDecrease.TLabel",
             background=COLORS["panel"],
             foreground="#15803d",
-            font=("Microsoft YaHei UI", 16, "bold"),
+            font=self.fonts["metric"],
         )
-        style.configure("Accent.TButton", font=("Microsoft YaHei UI", 9, "bold"))
-        style.configure("Treeview", rowheight=27, font=("Microsoft YaHei UI", 9))
-        style.configure("Treeview.Heading", font=("Microsoft YaHei UI", 9, "bold"))
+        style.configure("Accent.TButton", font=self.fonts["caption_bold"])
+        style.configure("Treeview", font=self.fonts["caption"])
+        style.configure("Treeview.Heading", font=self.fonts["caption_bold"])
+        self._update_scaled_style_metrics()
 
     def _build_ui(self) -> None:
         outer = ttk.Frame(self.root, padding=18)
@@ -875,7 +1053,7 @@ class DiskMonitorApp:
             text="空间分布",
             background=COLORS["panel"],
             foreground=COLORS["text"],
-            font=("Microsoft YaHei UI", 11, "bold"),
+            font=self.fonts["section"],
         ).pack(anchor=tk.W)
         ttk.Label(
             map_panel,
@@ -912,7 +1090,7 @@ class DiskMonitorApp:
             textvariable=self.trend_title_var,
             background=COLORS["panel"],
             foreground=COLORS["text"],
-            font=("Microsoft YaHei UI", 10, "bold"),
+            font=self.fonts["subheading"],
         ).pack(side=tk.LEFT)
         ttk.Label(
             trend_header,
@@ -947,7 +1125,7 @@ class DiskMonitorApp:
             text="空间变化来源（文件口径）",
             background=COLORS["panel"],
             foreground=COLORS["text"],
-            font=("Microsoft YaHei UI", 11, "bold"),
+            font=self.fonts["section"],
         ).pack(side=tk.LEFT)
         self.change_view_selector = ttk.Combobox(
             growth_header,
@@ -986,7 +1164,7 @@ class DiskMonitorApp:
             self.changes_tab,
             textvariable=self.baseline_info_var,
             foreground=COLORS["text"],
-            font=("Microsoft YaHei UI", 9, "bold"),
+            font=self.fonts["caption_bold"],
         ).pack(anchor=tk.W, pady=(8, 2))
         ttk.Label(
             self.changes_tab,
@@ -1008,7 +1186,7 @@ class DiskMonitorApp:
             textvariable=self.snapshot_total_var,
             bg=COLORS["panel"],
             fg=COLORS["text"],
-            font=("Microsoft YaHei UI", 11, "bold"),
+            font=self.fonts["section"],
             anchor=tk.W,
             justify=tk.LEFT,
         )
@@ -1024,7 +1202,7 @@ class DiskMonitorApp:
             textvariable=self.runtime_change_var,
             bg=COLORS["panel"],
             fg=COLORS["muted"],
-            font=("Microsoft YaHei UI", 10, "bold"),
+            font=self.fonts["subheading"],
             anchor=tk.W,
             justify=tk.LEFT,
             wraplength=570,
@@ -1041,7 +1219,7 @@ class DiskMonitorApp:
             textvariable=self.blind_spot_var,
             bg=COLORS["panel"],
             fg=COLORS["muted"],
-            font=("Microsoft YaHei UI", 10, "bold"),
+            font=self.fonts["subheading"],
             anchor=tk.W,
             justify=tk.LEFT,
             wraplength=570,
@@ -1058,7 +1236,7 @@ class DiskMonitorApp:
             textvariable=self.low_memory_change_var,
             bg=COLORS["panel"],
             fg=COLORS["muted"],
-            font=("Microsoft YaHei UI", 10, "bold"),
+            font=self.fonts["subheading"],
             anchor=tk.W,
             justify=tk.LEFT,
             wraplength=570,
@@ -1111,7 +1289,7 @@ class DiskMonitorApp:
             history_header,
             text="快照历史",
             foreground=COLORS["text"],
-            font=("Microsoft YaHei UI", 11, "bold"),
+            font=self.fonts["section"],
         ).pack(side=tk.LEFT)
         self.compare_history_button = ttk.Button(
             history_header,
@@ -1631,128 +1809,191 @@ class DiskMonitorApp:
         self._refresh_breadcrumbs()
         self._refresh_context_status()
 
-    def _open_settings(self) -> None:
-        window = tk.Toplevel(self.root)
-        window.title("设置")
-        window.resizable(False, False)
-        window.transient(self.root)
-        window.grab_set()
+    def _open_settings(self, *, from_tray: bool = False) -> None:
+        if self.settings_window is not None:
+            try:
+                if self.settings_window.winfo_exists():
+                    self.settings_window.deiconify()
+                    self.settings_window.state("normal")
+                    self.settings_window.lift()
+                    self.settings_window.focus_force()
+                    return
+            except tk.TclError:
+                pass
+            self.settings_window = None
 
-        body = ttk.Frame(window, padding=18)
-        body.pack(fill=tk.BOTH, expand=True)
+        window = tk.Toplevel(self.root)
+        self.settings_window = window
+        window.title("C 盘空间增长监控器 · 设置")
+        window.resizable(False, False)
+        window.configure(bg=COLORS["background"])
+        if self.app_icon_path.exists():
+            window.iconbitmap(default=str(self.app_icon_path))
+        if self._window_is_visible():
+            window.transient(self.root)
+        try:
+            window.wm_attributes("-toolwindow", True)
+        except tk.TclError:
+            pass
+
+        header = ttk.Frame(window, padding=(22, 18, 22, 12))
+        header.pack(fill=tk.X)
+        ttk.Label(header, text="应用设置", style="DialogTitle.TLabel").pack(
+            anchor=tk.W
+        )
         ttk.Label(
-            body,
-            text="关闭行为",
-            font=("Microsoft YaHei UI", 10, "bold"),
-        ).grid(row=0, column=0, sticky=tk.W, pady=(0, 6))
+            header,
+            text=(
+                "独立调整运行方式与自动低内存策略"
+                if from_tray
+                else "调整运行方式与自动低内存策略"
+            ),
+            style="Subtitle.TLabel",
+        ).pack(anchor=tk.W, pady=(3, 0))
+
+        body = ttk.Frame(window, padding=(22, 0, 22, 0))
+        body.pack(fill=tk.BOTH, expand=True)
+
+        general_panel = ttk.Frame(body, style="Panel.TFrame", padding=16)
+        general_panel.pack(fill=tk.X)
+        general_panel.columnconfigure(1, weight=1)
+        ttk.Label(
+            general_panel,
+            text="常规",
+            style="Section.TLabel",
+        ).grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 12))
+        ttk.Label(
+            general_panel,
+            text="关闭主窗口时",
+            background=COLORS["panel"],
+        ).grid(row=1, column=0, sticky=tk.W, padx=(0, 18), pady=4)
         current_behavior = self.storage.get_setting("close_behavior", "ask")
         behavior_var = tk.StringVar(
             value=CLOSE_BEHAVIOR_LABELS.get(current_behavior, "每次询问")
         )
         behavior_box = ttk.Combobox(
-            body,
+            general_panel,
             textvariable=behavior_var,
             values=tuple(CLOSE_BEHAVIOR_LABELS.values()),
             state="readonly",
-            width=24,
+            width=26,
         )
-        behavior_box.grid(row=1, column=0, sticky=tk.W)
+        behavior_box.grid(row=1, column=1, sticky=tk.EW, pady=4)
 
         ttk.Label(
-            body,
-            text="运行模式",
-            font=("Microsoft YaHei UI", 10, "bold"),
-        ).grid(row=2, column=0, sticky=tk.W, pady=(16, 6))
+            general_panel,
+            text="当前运行模式",
+            background=COLORS["panel"],
+        ).grid(row=2, column=0, sticky=tk.W, padx=(0, 18), pady=4)
         run_mode_var = tk.StringVar(value=RUN_MODE_LABELS[self.run_mode])
         run_mode_box = ttk.Combobox(
-            body,
+            general_panel,
             textvariable=run_mode_var,
             values=tuple(RUN_MODE_LABELS.values()),
             state="readonly",
-            width=24,
+            width=26,
         )
-        run_mode_box.grid(row=3, column=0, sticky=tk.W)
+        run_mode_box.grid(row=2, column=1, sticky=tk.EW, pady=4)
 
         autostart_var = tk.BooleanVar(value=is_autostart_enabled())
         ttk.Checkbutton(
-            body,
+            general_panel,
             text="登录 Windows 后自动启动监控器",
             variable=autostart_var,
-        ).grid(row=4, column=0, sticky=tk.W, pady=(16, 4))
+            style="Panel.TCheckbutton",
+        ).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(10, 0))
 
-        ttk.Separator(body).grid(row=5, column=0, sticky=tk.EW, pady=(12, 12))
+        automation_panel = ttk.Frame(body, style="Panel.TFrame", padding=16)
+        automation_panel.pack(fill=tk.X, pady=(12, 0))
+        automation_panel.columnconfigure(1, weight=1)
         ttk.Label(
-            body,
+            automation_panel,
             text="自动低内存模式",
-            font=("Microsoft YaHei UI", 10, "bold"),
-        ).grid(row=6, column=0, sticky=tk.W, pady=(0, 6))
+            style="Section.TLabel",
+        ).grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 10))
         auto_enabled_var = tk.BooleanVar(value=self.auto_mode_config.enabled)
         ttk.Checkbutton(
-            body,
+            automation_panel,
             text="检测指定进程或内存压力后自动切换",
             variable=auto_enabled_var,
-        ).grid(row=7, column=0, sticky=tk.W)
+            style="Panel.TCheckbutton",
+        ).grid(row=1, column=0, columnspan=2, sticky=tk.W)
         ttk.Label(
-            body,
-            text="监控进程（分号分隔，可省略 .exe）",
-            foreground=COLORS["muted"],
-        ).grid(row=8, column=0, sticky=tk.W, pady=(8, 2))
+            automation_panel,
+            text="监控进程",
+            background=COLORS["panel"],
+        ).grid(row=2, column=0, sticky=tk.W, padx=(0, 18), pady=(12, 4))
         process_names_var = tk.StringVar(
             value=";".join(self.auto_mode_config.process_names)
         )
-        ttk.Entry(
-            body,
+        process_names_entry = ttk.Entry(
+            automation_panel,
             textvariable=process_names_var,
-            width=48,
-        ).grid(row=9, column=0, sticky=tk.EW)
+            width=34,
+        )
+        process_names_entry.grid(row=2, column=1, sticky=tk.EW, pady=(12, 4))
+        ttk.Label(
+            automation_panel,
+            text="用分号分隔，可省略 .exe",
+            style="PanelMuted.TLabel",
+        ).grid(row=3, column=1, sticky=tk.W)
         memory_pressure_var = tk.BooleanVar(
             value=self.auto_mode_config.memory_pressure_enabled
         )
         ttk.Checkbutton(
-            body,
+            automation_panel,
             text="使用系统内存压力作为兜底触发条件",
             variable=memory_pressure_var,
-        ).grid(row=10, column=0, sticky=tk.W, pady=(8, 2))
-        threshold_row = ttk.Frame(body)
-        threshold_row.grid(row=11, column=0, sticky=tk.W)
+            style="Panel.TCheckbutton",
+        ).grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(10, 4))
+        threshold_row = ttk.Frame(automation_panel, style="Panel.TFrame")
+        threshold_row.grid(row=5, column=0, columnspan=2, sticky=tk.W)
         high_percent_var = tk.StringVar(
             value=str(self.auto_mode_config.high_percent)
         )
         low_percent_var = tk.StringVar(
             value=str(self.auto_mode_config.low_percent)
         )
-        ttk.Label(threshold_row, text="进入阈值").pack(side=tk.LEFT)
+        ttk.Label(
+            threshold_row, text="进入阈值", background=COLORS["panel"]
+        ).pack(side=tk.LEFT)
         ttk.Entry(
             threshold_row, textvariable=high_percent_var, width=5
-        ).pack(side=tk.LEFT, padx=(4, 2))
-        ttk.Label(threshold_row, text="%　恢复阈值").pack(side=tk.LEFT)
+        ).pack(side=tk.LEFT, padx=(6, 3))
+        ttk.Label(
+            threshold_row, text="%    恢复阈值", background=COLORS["panel"]
+        ).pack(side=tk.LEFT)
         ttk.Entry(
             threshold_row, textvariable=low_percent_var, width=5
-        ).pack(side=tk.LEFT, padx=(4, 2))
-        ttk.Label(threshold_row, text="%").pack(side=tk.LEFT)
+        ).pack(side=tk.LEFT, padx=(6, 3))
         ttk.Label(
-            body,
-            text="自动恢复全功能后的处理",
-            foreground=COLORS["muted"],
-        ).grid(row=12, column=0, sticky=tk.W, pady=(8, 2))
+            threshold_row, text="%", background=COLORS["panel"]
+        ).pack(side=tk.LEFT)
+        ttk.Label(
+            automation_panel,
+            text="恢复全功能后",
+            background=COLORS["panel"],
+        ).grid(row=6, column=0, sticky=tk.W, padx=(0, 18), pady=(12, 0))
         resume_rescan_var = tk.StringVar(
             value=AUTO_RESCAN_LABELS[self.auto_mode_config.resume_rescan]
         )
         ttk.Combobox(
-            body,
+            automation_panel,
             textvariable=resume_rescan_var,
             values=tuple(AUTO_RESCAN_LABELS.values()),
             state="readonly",
-            width=28,
-        ).grid(row=13, column=0, sticky=tk.W)
-        ttk.Label(
-            body,
-            text="分钟采样保留 30 天，原始目录快照保留 90 天。",
-            foreground=COLORS["muted"],
-        ).grid(row=14, column=0, sticky=tk.W, pady=(12, 16))
+            width=26,
+        ).grid(row=6, column=1, sticky=tk.EW, pady=(12, 0))
 
-        buttons = ttk.Frame(body)
-        buttons.grid(row=15, column=0, sticky=tk.E)
+        footer = ttk.Frame(window, padding=(22, 12, 22, 18))
+        footer.pack(fill=tk.X)
+        ttk.Label(
+            footer,
+            text="分钟采样保留 30 天 · 目录快照保留 90 天",
+            style="Subtitle.TLabel",
+        ).pack(side=tk.LEFT, pady=(5, 0))
+        buttons = ttk.Frame(footer)
+        buttons.pack(side=tk.RIGHT)
 
         def save_settings() -> None:
             behavior = next(
@@ -1793,13 +2034,42 @@ class DiskMonitorApp:
                 messagebox.showerror("设置失败", str(error), parent=window)
                 return
             self.status_var.set("设置已保存")
-            window.destroy()
+            self._close_settings_window()
 
-        ttk.Button(buttons, text="取消", command=window.destroy).pack(side=tk.RIGHT)
-        ttk.Button(buttons, text="保存", command=save_settings).pack(
+        ttk.Button(
+            buttons,
+            text="取消",
+            command=self._close_settings_window,
+        ).pack(side=tk.RIGHT)
+        save_button = ttk.Button(buttons, text="保存", command=save_settings)
+        save_button.pack(
             side=tk.RIGHT, padx=(0, 8)
         )
-        window.protocol("WM_DELETE_WINDOW", window.destroy)
+        window.protocol("WM_DELETE_WINDOW", self._close_settings_window)
+        window.bind("<Escape>", lambda _event: self._close_settings_window())
+        window.bind("<Return>", lambda _event: save_settings())
+        window.bind("<Configure>", self._schedule_display_sync, add="+")
+        window.grab_set()
+        position_near_cursor(window)
+        behavior_box.focus_set()
+        window.lift()
+        window.focus_force()
+
+    def _close_settings_window(self) -> None:
+        window = self.settings_window
+        self.settings_window = None
+        if window is None:
+            return
+        try:
+            if window.grab_current() is window:
+                window.grab_release()
+        except tk.TclError:
+            pass
+        try:
+            if window.winfo_exists():
+                window.destroy()
+        except tk.TclError:
+            pass
 
     def _sample_now(self) -> None:
         self.sample_after_id = None
@@ -3058,7 +3328,7 @@ class DiskMonitorApp:
                 height / 2,
                 text=self.treemap_placeholder_text,
                 fill=COLORS["muted"],
-                font=("Microsoft YaHei UI", 11),
+                font=self.fonts["body_emphasis"],
                 width=max(width - 30, 20),
             )
             return
@@ -3122,7 +3392,7 @@ class DiskMonitorApp:
                     anchor=tk.NW,
                     width=max(rect_width - 14, 10),
                     fill="#172033",
-                    font=("Microsoft YaHei UI", 8, "bold"),
+                    font=self.fonts["tiny_bold"],
                 )
             animations.append(
                 (
@@ -3318,7 +3588,7 @@ class DiskMonitorApp:
                 height / 2,
                 text="正在建立趋势数据……",
                 fill=COLORS["muted"],
-                font=("Microsoft YaHei UI", 9),
+                font=self.fonts["caption"],
             )
             return
         padding_x = 12
@@ -3418,7 +3688,7 @@ class DiskMonitorApp:
             anchor=tk.NW,
             text=f"最高 {format_bytes(high)}",
             fill=COLORS["muted"],
-            font=("Microsoft YaHei UI", 8),
+            font=self.fonts["tiny"],
         )
         canvas.create_text(
             width - padding_x,
@@ -3426,7 +3696,7 @@ class DiskMonitorApp:
             anchor=tk.SE,
             text=f"最低 {format_bytes(low)}",
             fill=COLORS["muted"],
-            font=("Microsoft YaHei UI", 8),
+            font=self.fonts["tiny"],
         )
 
     def _hover_trend(self, event: tk.Event) -> None:
@@ -3504,6 +3774,7 @@ class DiskMonitorApp:
             "automation_after_id",
             "treemap_animation_after_id",
             "treemap_resize_after_id",
+            "display_after_id",
         ):
             callback_id = getattr(self, attribute, None)
             if callback_id is not None:
@@ -3512,6 +3783,7 @@ class DiskMonitorApp:
                 except tk.TclError:
                     pass
                 setattr(self, attribute, None)
+        self._close_settings_window()
         if self.tray_icon is not None:
             try:
                 self.tray_icon.stop()
@@ -3622,7 +3894,9 @@ class DiskMonitorApp:
 
 
 def main() -> None:
+    awareness_status = enable_per_monitor_dpi_awareness()
     root = tk.Tk()
     initial_path = os.environ.get("DISK_GROWTH_MONITOR_INITIAL_PATH", "C:\\")
-    DiskMonitorApp(root, initial_path=initial_path, enable_tray=True)
+    app = DiskMonitorApp(root, initial_path=initial_path, enable_tray=True)
+    app.logger.info("dpi_awareness status=%s", awareness_status)
     root.mainloop()

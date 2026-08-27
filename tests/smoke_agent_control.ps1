@@ -7,12 +7,12 @@ $ErrorActionPreference = "Stop"
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $guiExe = if ([string]::IsNullOrWhiteSpace($GuiExePath)) {
-    Join-Path $projectRoot "dist\disk-space-growth-monitor-v0.7.4.exe"
+    Join-Path $projectRoot "dist\disk-space-growth-monitor-v0.7.5.exe"
 } else {
     [System.IO.Path]::GetFullPath($GuiExePath)
 }
 $cliExe = if ([string]::IsNullOrWhiteSpace($CliExePath)) {
-    Join-Path $projectRoot "dist\diskmonitor-cli-v0.7.4.exe"
+    Join-Path $projectRoot "dist\diskmonitor-cli-v0.7.5.exe"
 } else {
     [System.IO.Path]::GetFullPath($CliExePath)
 }
