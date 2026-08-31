@@ -49,7 +49,11 @@ from .navigation import (
 )
 from .readonly import ReadOnlyDatabase
 from .scanner import ScanCancelled, scan_path
-from .settings_view import validate_settings_submission
+from .settings_view import (
+    SettingsDialog,
+    SettingsDialogState,
+    SettingsSubmission,
+)
 from .service import (
     calculate_blind_spot,
     continuous_baseline_snapshot_id,
@@ -1972,258 +1976,61 @@ class DiskMonitorApp:
         except tk.TclError:
             pass
 
-        header = ttk.Frame(window, padding=(22, 18, 22, 12))
-        header.pack(fill=tk.X)
-        ttk.Label(header, text="应用设置", style="DialogTitle.TLabel").pack(
-            anchor=tk.W
-        )
-        ttk.Label(
-            header,
-            text=(
-                "独立调整运行方式与自动低内存策略"
-                if from_tray
-                else "调整运行方式与自动低内存策略"
-            ),
-            style="Subtitle.TLabel",
-        ).pack(anchor=tk.W, pady=(3, 0))
-
-        body = ttk.Frame(window, padding=(22, 0, 22, 0))
-        body.pack(fill=tk.BOTH, expand=True)
-
-        general_panel = ttk.Frame(body, style="Panel.TFrame", padding=16)
-        general_panel.pack(fill=tk.X)
-        general_panel.columnconfigure(1, weight=1)
-        ttk.Label(
-            general_panel,
-            text="常规",
-            style="Section.TLabel",
-        ).grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 12))
-        ttk.Label(
-            general_panel,
-            text="关闭主窗口时",
-            background=COLORS["panel"],
-        ).grid(row=1, column=0, sticky=tk.W, padx=(0, 18), pady=4)
         current_behavior = self.storage.get_setting("close_behavior", "ask")
-        behavior_var = tk.StringVar(
-            value=CLOSE_BEHAVIOR_LABELS.get(current_behavior, "每次询问")
+        dialog = SettingsDialog(
+            window,
+            state=SettingsDialogState(
+                close_behavior_label=CLOSE_BEHAVIOR_LABELS.get(
+                    current_behavior, "每次询问"
+                ),
+                run_mode_label=RUN_MODE_LABELS[self.run_mode],
+                autostart_enabled=is_autostart_enabled(),
+                collect_file_space=self.collect_file_space,
+                exclude_rules=self.exclude_rules,
+                auto_mode_config=self.auto_mode_config,
+            ),
+            session_root_path=self.session_root_path,
+            from_tray=from_tray,
+            panel_background=COLORS["panel"],
+            close_behavior_labels=CLOSE_BEHAVIOR_LABELS,
+            run_mode_labels=RUN_MODE_LABELS,
+            auto_rescan_labels=AUTO_RESCAN_LABELS,
+            on_submit=lambda submission: self._save_settings_submission(
+                submission, parent=window
+            ),
+            on_close=self._close_settings_window,
         )
-        behavior_box = ttk.Combobox(
-            general_panel,
-            textvariable=behavior_var,
-            values=tuple(CLOSE_BEHAVIOR_LABELS.values()),
-            state="readonly",
-            width=26,
-        )
-        behavior_box.grid(row=1, column=1, sticky=tk.EW, pady=4)
-
-        ttk.Label(
-            general_panel,
-            text="当前运行模式",
-            background=COLORS["panel"],
-        ).grid(row=2, column=0, sticky=tk.W, padx=(0, 18), pady=4)
-        run_mode_var = tk.StringVar(value=RUN_MODE_LABELS[self.run_mode])
-        run_mode_box = ttk.Combobox(
-            general_panel,
-            textvariable=run_mode_var,
-            values=tuple(RUN_MODE_LABELS.values()),
-            state="readonly",
-            width=26,
-        )
-        run_mode_box.grid(row=2, column=1, sticky=tk.EW, pady=4)
-
-        autostart_var = tk.BooleanVar(value=is_autostart_enabled())
-        ttk.Checkbutton(
-            general_panel,
-            text="登录 Windows 后自动启动监控器",
-            variable=autostart_var,
-            style="Panel.TCheckbutton",
-        ).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(10, 0))
-        file_space_var = tk.BooleanVar(value=self.collect_file_space)
-        ttk.Checkbutton(
-            general_panel,
-            text="扫描时读取分配大小与硬链接（精确但明显更慢）",
-            variable=file_space_var,
-            style="Panel.TCheckbutton",
-        ).grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(10, 0))
-        ttk.Label(
-            general_panel,
-            text="默认关闭；只影响保存设置后的新扫描",
-            style="PanelMuted.TLabel",
-        ).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(3, 0))
-        ttk.Label(
-            general_panel,
-            text="扫描排除规则",
-            background=COLORS["panel"],
-        ).grid(row=6, column=0, sticky=tk.NW, padx=(0, 18), pady=(12, 4))
-        exclude_rules_text = tk.Text(
-            general_panel,
-            width=34,
-            height=4,
-            wrap="none",
-            relief=tk.SOLID,
-            borderwidth=1,
-        )
-        exclude_rules_text.grid(row=6, column=1, sticky=tk.EW, pady=(12, 4))
-        exclude_rules_text.insert("1.0", "\n".join(self.exclude_rules))
-        ttk.Label(
-            general_panel,
-            text="逐行填写扫描根内绝对路径或相对 glob；默认不排除任何目录",
-            style="PanelMuted.TLabel",
-        ).grid(row=7, column=0, columnspan=2, sticky=tk.W, pady=(0, 2))
-
-        automation_panel = ttk.Frame(body, style="Panel.TFrame", padding=16)
-        automation_panel.pack(fill=tk.X, pady=(12, 0))
-        automation_panel.columnconfigure(1, weight=1)
-        ttk.Label(
-            automation_panel,
-            text="自动低内存模式",
-            style="Section.TLabel",
-        ).grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 10))
-        auto_enabled_var = tk.BooleanVar(value=self.auto_mode_config.enabled)
-        ttk.Checkbutton(
-            automation_panel,
-            text="检测指定进程或内存压力后自动切换",
-            variable=auto_enabled_var,
-            style="Panel.TCheckbutton",
-        ).grid(row=1, column=0, columnspan=2, sticky=tk.W)
-        ttk.Label(
-            automation_panel,
-            text="监控进程",
-            background=COLORS["panel"],
-        ).grid(row=2, column=0, sticky=tk.W, padx=(0, 18), pady=(12, 4))
-        process_names_var = tk.StringVar(
-            value=";".join(self.auto_mode_config.process_names)
-        )
-        process_names_entry = ttk.Entry(
-            automation_panel,
-            textvariable=process_names_var,
-            width=34,
-        )
-        process_names_entry.grid(row=2, column=1, sticky=tk.EW, pady=(12, 4))
-        ttk.Label(
-            automation_panel,
-            text="用分号分隔，可省略 .exe",
-            style="PanelMuted.TLabel",
-        ).grid(row=3, column=1, sticky=tk.W)
-        memory_pressure_var = tk.BooleanVar(
-            value=self.auto_mode_config.memory_pressure_enabled
-        )
-        ttk.Checkbutton(
-            automation_panel,
-            text="使用系统内存压力作为兜底触发条件",
-            variable=memory_pressure_var,
-            style="Panel.TCheckbutton",
-        ).grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(10, 4))
-        threshold_row = ttk.Frame(automation_panel, style="Panel.TFrame")
-        threshold_row.grid(row=5, column=0, columnspan=2, sticky=tk.W)
-        high_percent_var = tk.StringVar(
-            value=str(self.auto_mode_config.high_percent)
-        )
-        low_percent_var = tk.StringVar(
-            value=str(self.auto_mode_config.low_percent)
-        )
-        ttk.Label(
-            threshold_row, text="进入阈值", background=COLORS["panel"]
-        ).pack(side=tk.LEFT)
-        ttk.Entry(
-            threshold_row, textvariable=high_percent_var, width=5
-        ).pack(side=tk.LEFT, padx=(6, 3))
-        ttk.Label(
-            threshold_row, text="%    恢复阈值", background=COLORS["panel"]
-        ).pack(side=tk.LEFT)
-        ttk.Entry(
-            threshold_row, textvariable=low_percent_var, width=5
-        ).pack(side=tk.LEFT, padx=(6, 3))
-        ttk.Label(
-            threshold_row, text="%", background=COLORS["panel"]
-        ).pack(side=tk.LEFT)
-        ttk.Label(
-            automation_panel,
-            text="恢复全功能后",
-            background=COLORS["panel"],
-        ).grid(row=6, column=0, sticky=tk.W, padx=(0, 18), pady=(12, 0))
-        resume_rescan_var = tk.StringVar(
-            value=AUTO_RESCAN_LABELS[self.auto_mode_config.resume_rescan]
-        )
-        ttk.Combobox(
-            automation_panel,
-            textvariable=resume_rescan_var,
-            values=tuple(AUTO_RESCAN_LABELS.values()),
-            state="readonly",
-            width=26,
-        ).grid(row=6, column=1, sticky=tk.EW, pady=(12, 0))
-
-        footer = ttk.Frame(window, padding=(22, 12, 22, 18))
-        footer.pack(fill=tk.X)
-        ttk.Label(
-            footer,
-            text="分钟采样保留 30 天 · 目录快照保留 90 天",
-            style="Subtitle.TLabel",
-        ).pack(side=tk.LEFT, pady=(5, 0))
-        buttons = ttk.Frame(footer)
-        buttons.pack(side=tk.RIGHT)
-
-        def save_settings() -> None:
-            try:
-                submission = validate_settings_submission(
-                    close_behavior_label=behavior_var.get(),
-                    run_mode_label=run_mode_var.get(),
-                    autostart_enabled=autostart_var.get(),
-                    collect_file_space=file_space_var.get(),
-                    exclude_rules_text=exclude_rules_text.get("1.0", "end"),
-                    auto_enabled=auto_enabled_var.get(),
-                    process_names_text=process_names_var.get(),
-                    memory_pressure_enabled=memory_pressure_var.get(),
-                    high_percent_text=high_percent_var.get(),
-                    low_percent_text=low_percent_var.get(),
-                    resume_rescan_label=resume_rescan_var.get(),
-                    session_root_path=self.session_root_path,
-                    close_behavior_labels=CLOSE_BEHAVIOR_LABELS,
-                    run_mode_labels=RUN_MODE_LABELS,
-                    auto_rescan_labels=AUTO_RESCAN_LABELS,
-                )
-            except ValueError as error:
-                messagebox.showerror("设置无效", str(error), parent=window)
-                return
-            if not self._request_run_mode(submission.run_mode, parent=window):
-                return
-            try:
-                self.storage.set_setting("close_behavior", submission.close_behavior)
-                self.collect_file_space = submission.collect_file_space
-                self.storage.set_setting(
-                    "file_space_accounting",
-                    "exact" if self.collect_file_space else "logical",
-                )
-                self.exclude_rules = submission.exclude_rules
-                self.storage.set_setting(
-                    "exclude_rules", "\n".join(self.exclude_rules)
-                )
-                set_autostart(submission.autostart_enabled)
-                self._apply_automation_config(submission.auto_mode_config)
-            except (OSError, ValueError) as error:
-                messagebox.showerror("设置失败", str(error), parent=window)
-                return
-            self.status_var.set("设置已保存")
-            self._close_settings_window()
-
-        ttk.Button(
-            buttons,
-            text="取消",
-            command=self._close_settings_window,
-        ).pack(side=tk.RIGHT)
-        save_button = ttk.Button(buttons, text="保存", command=save_settings)
-        save_button.pack(
-            side=tk.RIGHT, padx=(0, 8)
-        )
+        behavior_box = dialog.build()
         window.protocol("WM_DELETE_WINDOW", self._close_settings_window)
         window.bind("<Escape>", lambda _event: self._close_settings_window())
-        window.bind("<Return>", lambda _event: save_settings())
         window.bind("<Configure>", self._schedule_display_sync, add="+")
         window.grab_set()
         position_near_cursor(window)
         behavior_box.focus_set()
         window.lift()
         window.focus_force()
+
+    def _save_settings_submission(
+        self, submission: SettingsSubmission, *, parent: tk.Toplevel
+    ) -> bool:
+        if not self._request_run_mode(submission.run_mode, parent=parent):
+            return False
+        try:
+            self.storage.set_setting("close_behavior", submission.close_behavior)
+            self.collect_file_space = submission.collect_file_space
+            self.storage.set_setting(
+                "file_space_accounting",
+                "exact" if self.collect_file_space else "logical",
+            )
+            self.exclude_rules = submission.exclude_rules
+            self.storage.set_setting("exclude_rules", "\n".join(self.exclude_rules))
+            set_autostart(submission.autostart_enabled)
+            self._apply_automation_config(submission.auto_mode_config)
+        except (OSError, ValueError) as error:
+            messagebox.showerror("设置失败", str(error), parent=parent)
+            return False
+        self.status_var.set("设置已保存")
+        return True
 
     def _close_settings_window(self) -> None:
         window = self.settings_window
