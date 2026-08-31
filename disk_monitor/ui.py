@@ -64,6 +64,8 @@ from .service import (
 from .storage import Storage
 from .tray import TrayState, WindowsTrayIcon
 from .trend_view import build_trend_geometry
+from .treemap_view import item_at as treemap_item_at
+from .treemap_view import layout_rectangles
 from .windows_display import (
     DisplayMetrics,
     cursor_work_area,
@@ -4130,11 +4132,8 @@ class DiskMonitorApp:
                 width=max(width - 30, 20),
             )
             return
-        target_rectangles: list[
-            tuple[float, float, float, float, ScanItem]
-        ] = []
-        self._layout_rectangles(
-            items, 3, 3, width - 6, height - 6, target_rectangles
+        target_rectangles = layout_rectangles(
+            items, 3, 3, width - 6, height - 6
         )
         drawable_rectangles = [
             rectangle
@@ -4244,56 +4243,8 @@ class DiskMonitorApp:
 
         animate_frame()
 
-    def _layout_rectangles(
-        self,
-        items: list[ScanItem],
-        x: float,
-        y: float,
-        width: float,
-        height: float,
-        output: list[tuple[float, float, float, float, ScanItem]] | None = None,
-    ) -> None:
-        target = self.rectangle_items if output is None else output
-        if not items or width <= 0 or height <= 0:
-            return
-        if len(items) == 1:
-            target.append((x, y, width, height, items[0]))
-            return
-
-        total = sum(item.size_bytes for item in items)
-        split_target = total / 2
-        accumulated = 0
-        split_index = 1
-        for index, item in enumerate(items[:-1], start=1):
-            accumulated += item.size_bytes
-            split_index = index
-            if accumulated >= split_target:
-                break
-        first = items[:split_index]
-        second = items[split_index:]
-        first_total = sum(item.size_bytes for item in first)
-        ratio = first_total / total if total else 0.5
-        if width >= height:
-            first_width = width * ratio
-            self._layout_rectangles(first, x, y, first_width, height, target)
-            self._layout_rectangles(
-                second, x + first_width, y, width - first_width, height, target
-            )
-        else:
-            first_height = height * ratio
-            self._layout_rectangles(first, x, y, width, first_height, target)
-            self._layout_rectangles(
-                second, x, y + first_height, width, height - first_height, target
-            )
-
-    def _item_at(self, x: float, y: float) -> ScanItem | None:
-        for left, top, width, height, item in reversed(self.rectangle_items):
-            if left <= x <= left + width and top <= y <= top + height:
-                return item
-        return None
-
     def _select_rectangle(self, event: tk.Event) -> None:
-        item = self._item_at(event.x, event.y)
+        item = treemap_item_at(self.rectangle_items, event.x, event.y)
         if item:
             kind = "目录" if item.kind == "directory" else "文件"
             self.detail_var.set(
@@ -4302,7 +4253,7 @@ class DiskMonitorApp:
             )
 
     def _hover_rectangle(self, event: tk.Event) -> None:
-        item = self._item_at(event.x, event.y)
+        item = treemap_item_at(self.rectangle_items, event.x, event.y)
         path = item.path if item is not None else None
         if path == self.hovered_rectangle_path:
             return
@@ -4346,7 +4297,7 @@ class DiskMonitorApp:
             )
 
     def _open_rectangle(self, event: tk.Event) -> None:
-        item = self._item_at(event.x, event.y)
+        item = treemap_item_at(self.rectangle_items, event.x, event.y)
         if item and item.kind == "directory" and os.path.isdir(item.path):
             self._navigate_to(item.path)
 
