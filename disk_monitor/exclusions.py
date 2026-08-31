@@ -43,6 +43,8 @@ class ExclusionMatcher:
         return tuple(rule.serialized for rule in self.rules)
 
     def matches(self, path: str) -> bool:
+        if not self.rules:
+            return False
         normalized = os.path.normcase(os.path.abspath(path))
         relative = os.path.relpath(normalized, self.root_path).replace("\\", "/")
         folded_relative = relative.casefold()

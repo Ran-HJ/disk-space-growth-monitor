@@ -12,11 +12,20 @@ from disk_monitor.navigation import (
     materialize_navigation_result,
     merge_directory_skeleton,
 )
+from disk_monitor.exclusions import compile_exclusion_rules
 from disk_monitor.scanner import scan_path
 from disk_monitor.windows_file_info import FileSpaceInfo
 
 
 class ScannerTests(unittest.TestCase):
+    def test_empty_exclusion_rules_skip_path_normalization(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            matcher = compile_exclusion_rules(temp_dir, ())
+            with patch("disk_monitor.exclusions.os.path.relpath") as relative:
+                self.assertFalse(matcher.matches(str(Path(temp_dir) / "file.bin")))
+
+        relative.assert_not_called()
+
     def test_exclusion_rules_skip_before_accounting_and_are_recorded(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
