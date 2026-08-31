@@ -309,6 +309,66 @@ class UiFlowTests(unittest.TestCase):
                     app.session_finished = True
                     app._destroy_root()
 
+    def test_settings_dialog_persists_validated_submission(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            scan_root = base / "scan-root"
+            scan_root.mkdir()
+            (scan_root / "data.bin").write_bytes(b"x" * 16)
+            storage = Storage(base / "monitor.db")
+            root = tk.Tk()
+            root.withdraw()
+            app = DiskMonitorApp(
+                root,
+                storage=storage,
+                initial_path=str(scan_root),
+                log_path=base / "ui.log",
+            )
+            try:
+                pump_until(
+                    root,
+                    lambda: app.current_result is not None
+                    and app.active_scan_role is None,
+                )
+                with patch("disk_monitor.ui.set_autostart") as set_autostart:
+                    app._open_settings()
+                    root.update()
+                    assert app.settings_window is not None
+                    text_widgets: list[tk.Text] = []
+                    combo_boxes: list[ttk.Combobox] = []
+                    buttons: dict[str, ttk.Button] = {}
+
+                    def collect(widget: tk.Misc) -> None:
+                        for child in widget.winfo_children():
+                            if isinstance(child, tk.Text):
+                                text_widgets.append(child)
+                            if isinstance(child, ttk.Combobox):
+                                combo_boxes.append(child)
+                            if isinstance(child, ttk.Button):
+                                buttons[str(child.cget("text"))] = child
+                            collect(child)
+
+                    collect(app.settings_window)
+                    self.assertEqual(len(text_widgets), 1)
+                    text_widgets[0].insert("1.0", "*.tmp\n")
+                    behavior_box = next(
+                        box
+                        for box in combo_boxes
+                        if "始终快速退出" in tuple(box.cget("values"))
+                    )
+                    behavior_box.set("始终快速退出")
+                    buttons["保存"].invoke()
+                    root.update()
+
+                self.assertIsNone(app.settings_window)
+                self.assertEqual(storage.get_setting("close_behavior"), "quick")
+                self.assertEqual(storage.get_setting("exclude_rules"), "*.tmp")
+                self.assertEqual(app.exclude_rules, ("*.tmp",))
+                set_autostart.assert_called_once_with(False)
+            finally:
+                app.session_finished = True
+                app._destroy_root()
+
     def test_scan_and_full_close_complete_session(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)

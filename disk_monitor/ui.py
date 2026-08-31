@@ -28,7 +28,6 @@ from .automation import (
 from .autostart import is_autostart_enabled, set_autostart
 from .control_bridge import GuiControlBridge
 from .control_protocol import ControlError
-from .exclusions import compile_exclusion_rules
 from .formatting import format_bytes
 from .growth_tree import GrowthTreeNode, build_growth_tree
 from .models import (
@@ -50,6 +49,7 @@ from .navigation import (
 )
 from .readonly import ReadOnlyDatabase
 from .scanner import ScanCancelled, scan_path
+from .settings_view import validate_settings_submission
 from .service import (
     calculate_blind_spot,
     continuous_baseline_snapshot_id,
@@ -2164,57 +2164,42 @@ class DiskMonitorApp:
         buttons.pack(side=tk.RIGHT)
 
         def save_settings() -> None:
-            behavior = next(
-                key
-                for key, label in CLOSE_BEHAVIOR_LABELS.items()
-                if label == behavior_var.get()
-            )
-            requested_mode = next(
-                key
-                for key, label in RUN_MODE_LABELS.items()
-                if label == run_mode_var.get()
-            )
             try:
-                requested_exclude_rules = tuple(
-                    line.strip()
-                    for line in exclude_rules_text.get("1.0", "end").splitlines()
-                    if line.strip()
-                )
-                compile_exclusion_rules(
-                    self.session_root_path, list(requested_exclude_rules)
-                )
-                auto_config = AutoModeConfig(
-                    enabled=auto_enabled_var.get(),
-                    process_names=normalize_process_names(
-                        process_names_var.get()
-                    ),
+                submission = validate_settings_submission(
+                    close_behavior_label=behavior_var.get(),
+                    run_mode_label=run_mode_var.get(),
+                    autostart_enabled=autostart_var.get(),
+                    collect_file_space=file_space_var.get(),
+                    exclude_rules_text=exclude_rules_text.get("1.0", "end"),
+                    auto_enabled=auto_enabled_var.get(),
+                    process_names_text=process_names_var.get(),
                     memory_pressure_enabled=memory_pressure_var.get(),
-                    high_percent=int(high_percent_var.get().strip()),
-                    low_percent=int(low_percent_var.get().strip()),
-                    resume_rescan=next(
-                        key
-                        for key, label in AUTO_RESCAN_LABELS.items()
-                        if label == resume_rescan_var.get()
-                    ),
-                ).validate()
-            except (ValueError, StopIteration) as error:
+                    high_percent_text=high_percent_var.get(),
+                    low_percent_text=low_percent_var.get(),
+                    resume_rescan_label=resume_rescan_var.get(),
+                    session_root_path=self.session_root_path,
+                    close_behavior_labels=CLOSE_BEHAVIOR_LABELS,
+                    run_mode_labels=RUN_MODE_LABELS,
+                    auto_rescan_labels=AUTO_RESCAN_LABELS,
+                )
+            except ValueError as error:
                 messagebox.showerror("设置无效", str(error), parent=window)
                 return
-            if not self._request_run_mode(requested_mode, parent=window):
+            if not self._request_run_mode(submission.run_mode, parent=window):
                 return
             try:
-                self.storage.set_setting("close_behavior", behavior)
-                self.collect_file_space = file_space_var.get()
+                self.storage.set_setting("close_behavior", submission.close_behavior)
+                self.collect_file_space = submission.collect_file_space
                 self.storage.set_setting(
                     "file_space_accounting",
                     "exact" if self.collect_file_space else "logical",
                 )
-                self.exclude_rules = requested_exclude_rules
+                self.exclude_rules = submission.exclude_rules
                 self.storage.set_setting(
                     "exclude_rules", "\n".join(self.exclude_rules)
                 )
-                set_autostart(autostart_var.get())
-                self._apply_automation_config(auto_config)
+                set_autostart(submission.autostart_enabled)
+                self._apply_automation_config(submission.auto_mode_config)
             except (OSError, ValueError) as error:
                 messagebox.showerror("设置失败", str(error), parent=window)
                 return
