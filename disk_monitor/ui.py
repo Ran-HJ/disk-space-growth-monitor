@@ -57,15 +57,13 @@ from .settings_view import (
 from .service import (
     calculate_blind_spot,
     continuous_baseline_snapshot_id,
-    downsample_disk_samples,
-    find_sample_gaps,
     nearest_disk_sample,
     normalize_drive,
     read_disk_sample,
-    split_sample_segments,
 )
 from .storage import Storage
 from .tray import TrayState, WindowsTrayIcon
+from .trend_view import build_trend_geometry
 from .windows_display import (
     DisplayMetrics,
     cursor_work_area,
@@ -4379,10 +4377,19 @@ class DiskMonitorApp:
         self.trend_marker_positions.clear()
         width = max(canvas.winfo_width(), 2)
         height = max(canvas.winfo_height(), 2)
-        samples = self.latest_samples
-        if not samples:
-            self.trend_window_start = None
-            self.trend_window_end = None
+        geometry = build_trend_geometry(
+            self.latest_samples,
+            self.session_boundaries,
+            now=datetime.now(),
+            hours=self.trend_hours,
+            width=width,
+            height=height,
+            max_points=self.TREND_MAX_POINTS,
+            gap_threshold=self.TREND_GAP_THRESHOLD,
+        )
+        self.trend_window_start = geometry.window_start
+        self.trend_window_end = geometry.window_end
+        if not geometry.has_samples:
             canvas.create_text(
                 width / 2,
                 height / 2,
@@ -4393,78 +4400,31 @@ class DiskMonitorApp:
             return
         padding_x = 12
         padding_y = 12
-        window_end = datetime.now()
-        window_start = window_end - timedelta(hours=self.trend_hours)
-        self.trend_window_start = window_start
-        self.trend_window_end = window_end
-        seconds = max((window_end - window_start).total_seconds(), 1)
-
-        def x_for(moment: datetime) -> float:
-            fraction = (moment - window_start).total_seconds() / seconds
-            return padding_x + max(0.0, min(fraction, 1.0)) * (
-                width - 2 * padding_x
-            )
-
-        values = [sample.used_bytes for sample in samples]
-        low = min(values)
-        high = max(values)
-        value_range = max(high - low, 1)
-
-        gaps = find_sample_gaps(
-            samples, gap_threshold=self.TREND_GAP_THRESHOLD
-        )
-        if len(gaps) > 500:
-            step = len(gaps) / 500
-            gaps = [gaps[int(index * step)] for index in range(500)]
-        for gap_start, gap_end in gaps:
+        assert geometry.low is not None
+        assert geometry.high is not None
+        for gap_start, gap_end in geometry.gap_rectangles:
             canvas.create_rectangle(
-                x_for(gap_start),
+                gap_start,
                 padding_y,
-                x_for(gap_end),
+                gap_end,
                 height - padding_y,
                 fill="#fed7aa",
                 outline="",
                 stipple="gray50",
             )
 
-        for boundary in self.session_boundaries:
-            x = x_for(boundary.occurred_at)
-            self.trend_marker_positions.append((x, boundary))
+        for marker in geometry.markers:
+            self.trend_marker_positions.append((marker.x, marker.boundary))
             canvas.create_line(
-                x,
+                marker.x,
                 padding_y,
-                x,
+                marker.x,
                 height - padding_y,
                 fill="#94a3b8",
                 dash=(2, 3),
             )
 
-        raw_segments = split_sample_segments(
-            samples, gap_threshold=self.TREND_GAP_THRESHOLD
-        )
-        if len(raw_segments) > 500:
-            step = len(raw_segments) / 500
-            raw_segments = [
-                raw_segments[int(index * step)] for index in range(500)
-            ]
-        total_samples = max(len(samples), 1)
-        for segment in raw_segments:
-            allowance = max(
-                2,
-                round(self.TREND_MAX_POINTS * len(segment) / total_samples),
-            )
-            drawn = downsample_disk_samples(segment, max_points=allowance)
-            points = [
-                (
-                    x_for(sample.recorded_at),
-                    height
-                    - padding_y
-                    - (sample.used_bytes - low)
-                    * (height - 2 * padding_y)
-                    / value_range,
-                )
-                for sample in drawn
-            ]
+        for points in geometry.segments:
             if len(points) == 1:
                 x, y = points[0]
                 canvas.create_oval(
@@ -4486,7 +4446,7 @@ class DiskMonitorApp:
             padding_x,
             3,
             anchor=tk.NW,
-            text=f"最高 {format_bytes(high)}",
+            text=f"最高 {format_bytes(geometry.high)}",
             fill=COLORS["muted"],
             font=self.fonts["tiny"],
         )
@@ -4494,7 +4454,7 @@ class DiskMonitorApp:
             width - padding_x,
             height - 3,
             anchor=tk.SE,
-            text=f"最低 {format_bytes(low)}",
+            text=f"最低 {format_bytes(geometry.low)}",
             fill=COLORS["muted"],
             font=self.fonts["tiny"],
         )
