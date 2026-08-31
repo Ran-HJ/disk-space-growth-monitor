@@ -3,9 +3,9 @@ from __future__ import annotations
 import os
 import shutil
 from bisect import bisect_left
-from datetime import datetime
-from datetime import timedelta
 from collections.abc import Sequence
+from datetime import datetime, timedelta
+from itertools import pairwise
 
 from .models import BlindSpotResult, DiskSample, MonitorSession
 
@@ -90,7 +90,7 @@ def split_sample_segments(
     if not samples:
         return []
     segments: list[list[DiskSample]] = [[samples[0]]]
-    for previous, current in zip(samples, samples[1:]):
+    for previous, current in pairwise(samples):
         if current.recorded_at - previous.recorded_at > gap_threshold:
             segments.append([])
         segments[-1].append(current)
@@ -104,7 +104,7 @@ def find_sample_gaps(
 ) -> list[tuple[datetime, datetime]]:
     return [
         (previous.recorded_at, current.recorded_at)
-        for previous, current in zip(samples, samples[1:])
+        for previous, current in pairwise(samples)
         if current.recorded_at - previous.recorded_at > gap_threshold
     ]
 

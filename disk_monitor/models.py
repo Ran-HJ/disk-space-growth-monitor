@@ -23,6 +23,13 @@ class ScanItem:
     file_count: int
     depth: int
     modified_at: float = 0.0
+    allocated_size_bytes: int | None = None
+    unique_allocated_size_bytes: int | None = None
+    volume_serial_hex: str | None = None
+    file_id: bytes | None = None
+    link_count: int | None = None
+    is_unique_owner: bool | None = None
+    measurement_state: str = "legacy"
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +39,13 @@ class NavigationItem:
     size_bytes: int
     file_count: int
     modified_at: float = 0.0
+    allocated_size_bytes: int | None = None
+    unique_allocated_size_bytes: int | None = None
+    volume_serial_hex: str | None = None
+    file_id: bytes | None = None
+    link_count: int | None = None
+    is_unique_owner: bool | None = None
+    measurement_state: str = "legacy"
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +58,15 @@ class NavigationNode:
     direct_file_bytes: int
     direct_file_count: int
     children: tuple[NavigationItem, ...] = ()
+    allocated_size_bytes: int | None = None
+    unique_allocated_size_bytes: int | None = None
+    measured_allocated_bytes: int = 0
+    measured_unique_allocated_bytes: int = 0
+    eligible_file_count: int = 0
+    allocation_measured_file_count: int = 0
+    identity_measured_file_count: int = 0
+    metadata_error_count: int = 0
+    measurement_state: str = "legacy"
 
 
 @dataclass
@@ -68,6 +91,19 @@ class ScanResult:
     items: list[ScanItem] = field(default_factory=list)
     snapshot_id: int | None = None
     skeleton: DirectorySkeleton | None = None
+    allocated_total_bytes: int | None = None
+    unique_allocated_total_bytes: int | None = None
+    measured_allocated_bytes: int = 0
+    measured_unique_allocated_bytes: int = 0
+    eligible_file_count: int = 0
+    allocation_measured_file_count: int = 0
+    identity_measured_file_count: int = 0
+    metadata_error_count: int = 0
+    measurement_state: str = "legacy"
+    scan_config_version: int = 0
+    scan_config_json: str | None = None
+    excluded_rule_count: int = 0
+    excluded_item_count: int = 0
 
 
 @dataclass(frozen=True)

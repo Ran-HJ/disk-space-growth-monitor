@@ -6,14 +6,16 @@ import tkinter as tk
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+from tkinter import ttk
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from disk_monitor.models import DiskSample, GrowthItem
+from disk_monitor.models import DiskSample, GrowthItem, ScanResult
 from disk_monitor.scanner import scan_path
 from disk_monitor.service import BLIND_SPOT_THRESHOLD_BYTES, normalize_drive
 from disk_monitor.storage import Storage
 from disk_monitor.ui import BASELINE_MODE_LABELS, DiskMonitorApp
+from disk_monitor.windows_display import DisplayMetrics, WorkArea
 
 
 def pump_until(root: tk.Tk, condition, timeout: float = 10.0) -> None:
@@ -39,7 +41,274 @@ def wait_for_destroy(root: tk.Tk, timeout: float = 2.0) -> None:
     raise AssertionError("等待窗口正常销毁超时")
 
 
+def force_high_dpi_scaling(window: tk.Misc) -> DisplayMetrics:
+    previous = float(window.tk.call("tk", "scaling"))
+    target = 192 / 72
+    window.tk.call("tk", "scaling", target)
+    return DisplayMetrics(192, previous, target, abs(previous - target) >= 0.01)
+
+
 class UiFlowTests(unittest.TestCase):
+    def assert_widget_fully_visible(
+        self, window: tk.Misc, widget: tk.Misc
+    ) -> None:
+        self.assertTrue(widget.winfo_ismapped())
+        left = widget.winfo_rootx() - window.winfo_rootx()
+        top = widget.winfo_rooty() - window.winfo_rooty()
+        self.assertGreaterEqual(left, 0)
+        self.assertGreaterEqual(top, 0)
+        self.assertLessEqual(left + widget.winfo_width(), window.winfo_width())
+        self.assertLessEqual(top + widget.winfo_height(), window.winfo_height())
+
+    def test_snapshot_browser_uses_same_deep_tree_and_largest_file_view(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            scan_root = base / "scan-root"
+            deep = scan_root / "branch" / "deep"
+            deep.mkdir(parents=True)
+            (deep / "data.bin").write_bytes(b"x" * 64)
+            root = tk.Tk()
+            root.withdraw()
+            with patch(
+                "disk_monitor.ui.sync_tk_scaling",
+                side_effect=force_high_dpi_scaling,
+            ):
+                app = DiskMonitorApp(
+                    root,
+                    storage=Storage(base / "monitor.db"),
+                    initial_path=str(scan_root),
+                    log_path=base / "ui.log",
+                )
+            try:
+                pump_until(
+                    root,
+                    lambda: app.current_result is not None
+                    and app.active_scan_role is None,
+                )
+                work_area = (680, 380, WorkArea(0, 0, 1366, 768))
+                with patch(
+                    "disk_monitor.ui.cursor_work_area",
+                    return_value=work_area,
+                ), patch(
+                    "disk_monitor.windows_display.cursor_work_area",
+                    return_value=work_area,
+                ):
+                    app._open_current_snapshot_browser()
+                    root.update()
+                self.assertIsNotNone(app.snapshot_browser_window)
+                assert app.snapshot_browser_window is not None
+
+                buttons: dict[str, ttk.Button] = {}
+                trees: list[ttk.Treeview] = []
+                entries: list[ttk.Entry] = []
+                search_mode: ttk.Combobox | None = None
+
+                def collect(widget: tk.Misc) -> None:
+                    nonlocal search_mode
+                    for child in widget.winfo_children():
+                        if isinstance(child, ttk.Button):
+                            buttons[str(child.cget("text"))] = child
+                        if isinstance(child, ttk.Treeview):
+                            trees.append(child)
+                        if isinstance(child, ttk.Entry):
+                            entries.append(child)
+                        if isinstance(child, ttk.Combobox) and "路径前缀" in tuple(
+                            child.cget("values")
+                        ):
+                            search_mode = child
+                        collect(child)
+
+                collect(app.snapshot_browser_window)
+                self.assertIn("搜索", buttons)
+                self.assertIn("最大文件", buttons)
+                self.assertIn("下一页", buttons)
+                for text in ("上一级", "浏览当前层", "搜索", "最大文件", "下一页"):
+                    self.assert_widget_fully_visible(
+                        app.snapshot_browser_window, buttons[text]
+                    )
+                self.assertEqual(len(trees), 1)
+                self.assertIsNotNone(search_mode)
+                assert search_mode is not None
+                self.assertEqual(search_mode.get(), "子串")
+                browser_tree = trees[0]
+                root_rows = browser_tree.get_children()
+                self.assertTrue(root_rows)
+                self.assertIn("branch", browser_tree.item(root_rows[0], "text"))
+
+                buttons["最大文件"].invoke()
+                root.update()
+                largest_rows = browser_tree.get_children()
+                self.assertTrue(largest_rows)
+                self.assertIn("data.bin", browser_tree.item(largest_rows[0], "text"))
+
+                query_entry = next(
+                    entry
+                    for entry in entries
+                    if str(entry.cget("state")) != "readonly"
+                )
+                query_entry.insert(0, "data.bin")
+                query_entry.event_generate("<Return>")
+                root.update()
+                search_rows = browser_tree.get_children()
+                self.assertTrue(search_rows)
+                self.assertIn("data.bin", browser_tree.item(search_rows[0], "text"))
+            finally:
+                app.session_finished = True
+                app._destroy_root()
+
+    def test_migration_advice_window_is_read_only_and_has_no_action_button(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            scan_root = base / "scan-root"
+            scan_root.mkdir()
+            (scan_root / "data.bin").write_bytes(b"x" * 32)
+            root = tk.Tk()
+            root.withdraw()
+            with patch(
+                "disk_monitor.ui.sync_tk_scaling",
+                side_effect=force_high_dpi_scaling,
+            ):
+                app = DiskMonitorApp(
+                    root,
+                    storage=Storage(base / "monitor.db"),
+                    initial_path=str(scan_root),
+                    log_path=base / "ui.log",
+                )
+            try:
+                pump_until(
+                    root,
+                    lambda: app.current_result is not None
+                    and app.active_scan_role is None,
+                )
+                work_area = (680, 380, WorkArea(0, 0, 1366, 768))
+                with patch(
+                    "disk_monitor.ui.cursor_work_area",
+                    return_value=work_area,
+                ), patch(
+                    "disk_monitor.windows_display.cursor_work_area",
+                    return_value=work_area,
+                ):
+                    app._open_migration_advice()
+                    root.update()
+                self.assertIsNotNone(app.migration_window)
+                assert app.migration_window is not None
+
+                buttons: dict[str, ttk.Button] = {}
+
+                def collect_buttons(widget: tk.Misc) -> None:
+                    for child in widget.winfo_children():
+                        if isinstance(child, ttk.Button):
+                            buttons[str(child.cget("text"))] = child
+                        collect_buttons(child)
+
+                collect_buttons(app.migration_window)
+                self.assertIn("选择目标盘", buttons)
+                self.assertIn("刷新建议", buttons)
+                self.assertIn("关闭", buttons)
+                for text in ("选择目标盘", "刷新建议", "关闭"):
+                    self.assert_widget_fully_visible(
+                        app.migration_window, buttons[text]
+                    )
+                self.assertFalse(
+                    {"开始迁移", "执行", "应用", "复制", "删除", "回滚"}
+                    & buttons.keys()
+                )
+            finally:
+                app.session_finished = True
+                app._destroy_root()
+
+    def test_accounting_labels_distinguish_unrecorded_legacy_snapshot(self) -> None:
+        result = ScanResult(
+            root_path=r"C:\fixture",
+            started_at=datetime.now(),
+            finished_at=datetime.now(),
+            total_bytes=1,
+            file_count=1,
+            directory_count=1,
+            error_count=0,
+            snapshot_id=2,
+            allocated_total_bytes=4096,
+            unique_allocated_total_bytes=4096,
+            measurement_state="exact",
+        )
+        app = SimpleNamespace(
+            storage=SimpleNamespace(
+                previous_snapshot_id=lambda _result: 1,
+                compare_snapshot_accounting=lambda *_args, **_kwargs: {
+                    "available": False,
+                    "old_measurement_state": "legacy",
+                },
+            )
+        )
+
+        self.assertIn(
+            "未记录分配/硬链接",
+            DiskMonitorApp._result_space_text(
+                ScanResult(
+                    root_path=r"C:\fixture",
+                    started_at=datetime.now(),
+                    finished_at=datetime.now(),
+                    total_bytes=1,
+                    file_count=1,
+                    directory_count=1,
+                    error_count=0,
+                )
+            ),
+        )
+        self.assertEqual(
+            DiskMonitorApp._unique_growth_text(app, result),
+            "唯一分配变化不可比较（旧快照未记录该口径）",
+        )
+
+    def test_exact_file_space_setting_is_explicitly_passed_to_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            scan_root = base / "scan-root"
+            scan_root.mkdir()
+            (scan_root / "data.bin").write_bytes(b"x" * 4097)
+            storage = Storage(base / "monitor.db")
+            storage.set_setting("file_space_accounting", "exact")
+            storage.set_setting("exclude_rules", "*.tmp")
+            root = tk.Tk()
+            root.withdraw()
+            with patch(
+                "disk_monitor.ui.scan_path", wraps=scan_path
+            ) as scanner:
+                app = DiskMonitorApp(
+                    root,
+                    storage=storage,
+                    initial_path=str(scan_root),
+                    log_path=base / "ui.log",
+                )
+                try:
+                    pump_until(
+                        root,
+                        lambda: app.session_start_snapshot_id is not None
+                        and app.active_scan_role is None,
+                    )
+                    self.assertTrue(app.collect_file_space)
+                    self.assertTrue(
+                        any(
+                            call.kwargs.get("collect_file_space") is True
+                            for call in scanner.call_args_list
+                        )
+                    )
+                    self.assertTrue(
+                        any(
+                            call.kwargs.get("exclude_rules") == ("*.tmp",)
+                            for call in scanner.call_args_list
+                        )
+                    )
+                    self.assertIsNotNone(app.current_result)
+                    assert app.current_result is not None
+                    self.assertEqual(
+                        app.current_result.measurement_state, "exact"
+                    )
+                    self.assertIn("唯一分配", app.detail_var.get())
+                finally:
+                    app.session_finished = True
+                    app._destroy_root()
+
     def test_scan_and_full_close_complete_session(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)

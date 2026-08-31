@@ -95,6 +95,22 @@ class AgentControlTests(unittest.TestCase):
                 self.assertTrue(full["ok"])
                 self.assertEqual(app.run_mode, "full")
 
+                with patch.object(
+                    app, "_start_scan", side_effect=RuntimeError("boom")
+                ):
+                    failed_start = control_request(
+                        root,
+                        client,
+                        "scan.start",
+                        {"path": str(scan_root)},
+                    )
+                self.assertFalse(failed_start["ok"])
+                failed_task = app.agent_controller.tasks[
+                    failed_start["request_id"]
+                ]
+                self.assertEqual(failed_task["state"], "failed")
+                self.assertIsNone(app.agent_controller.active_request_id)
+
                 started = control_request(
                     root, client, "scan.start", {"path": str(scan_root)}
                 )
@@ -112,6 +128,46 @@ class AgentControlTests(unittest.TestCase):
                 tree = control_request(root, client, "tree.current", {"limit": 20})
                 self.assertTrue(tree["ok"])
                 self.assertTrue(tree["data"]["items"])
+                search = control_request(
+                    root,
+                    client,
+                    "search.current",
+                    {
+                        "query": "child.bin",
+                        "mode": "substring",
+                        "kind": "file",
+                        "limit": 1,
+                    },
+                )
+                largest = control_request(
+                    root, client, "largest.current", {"limit": 1}
+                )
+                self.assertEqual(search["data"]["items"][0]["name"], "child.bin")
+                self.assertEqual(largest["data"]["items"][0]["name"], "child.bin")
+                self.assertIn("Top N", largest["data"]["coverage"])
+                advice = control_request(
+                    root,
+                    client,
+                    "advice.current",
+                    {"target_path": str(base), "limit": 10},
+                )
+                self.assertTrue(advice["ok"])
+                self.assertIn("不会移动或修改文件", advice["data"]["notice"])
+                self.assertNotIn("action", advice["data"])
+                uncached = scan_root / "uncached"
+                uncached.mkdir()
+                previous_path = app.path_var.get()
+                previous_stack = list(app.nav_stack)
+                missing = control_request(
+                    root,
+                    client,
+                    "view.open",
+                    {"path": str(uncached), "scan_if_missing": False},
+                )
+                self.assertFalse(missing["ok"])
+                self.assertEqual(missing["code"], "not_found")
+                self.assertEqual(app.path_var.get(), previous_path)
+                self.assertEqual(app.nav_stack, previous_stack)
                 opened = control_request(
                     root,
                     client,
@@ -180,7 +236,15 @@ class AgentControlTests(unittest.TestCase):
                     and app.active_scan_role is None,
                 )
 
-                def slow_scan(path, *, cancel_event, progress_callback):
+                def slow_scan(
+                    path,
+                    *,
+                    cancel_event,
+                    progress_callback,
+                    collect_file_space,
+                    exclude_rules,
+                ):
+                    del collect_file_space, exclude_rules
                     while not cancel_event.wait(0.01):
                         progress_callback(
                             ScanProgress(str(path), 16, 1, 1, 0)

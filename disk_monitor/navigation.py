@@ -7,7 +7,6 @@ from dataclasses import replace
 from .models import (
     DirectorySkeleton,
     NavigationItem,
-    NavigationNode,
     ScanItem,
     ScanResult,
 )
@@ -37,6 +36,8 @@ def estimate_skeleton_bytes(skeleton: DirectorySkeleton) -> int:
         for child in node.children:
             total += sys.getsizeof(child) + sys.getsizeof(child.name)
             total += sys.getsizeof(child.size_bytes) + sys.getsizeof(child.file_count)
+            total += sys.getsizeof(child.volume_serial_hex)
+            total += sys.getsizeof(child.file_id)
     return total
 
 
@@ -95,6 +96,15 @@ def materialize_navigation_result(
                 file_count=child.file_count,
                 depth=1,
                 modified_at=child.modified_at,
+                allocated_size_bytes=child.allocated_size_bytes,
+                unique_allocated_size_bytes=(
+                    child.unique_allocated_size_bytes
+                ),
+                volume_serial_hex=child.volume_serial_hex,
+                file_id=child.file_id,
+                link_count=child.link_count,
+                is_unique_owner=child.is_unique_owner,
+                measurement_state=child.measurement_state,
             )
         )
         if child.kind == "file":
@@ -126,6 +136,9 @@ def materialize_navigation_result(
             file_count=node.file_count,
             depth=0,
             modified_at=node.modified_at,
+            allocated_size_bytes=node.allocated_size_bytes,
+            unique_allocated_size_bytes=node.unique_allocated_size_bytes,
+            measurement_state=node.measurement_state,
         )
     )
     return ScanResult(
@@ -138,6 +151,19 @@ def materialize_navigation_result(
         error_count=node.error_count,
         items=items,
         skeleton=skeleton,
+        allocated_total_bytes=node.allocated_size_bytes,
+        unique_allocated_total_bytes=node.unique_allocated_size_bytes,
+        measured_allocated_bytes=node.measured_allocated_bytes,
+        measured_unique_allocated_bytes=(
+            node.measured_unique_allocated_bytes
+        ),
+        eligible_file_count=node.eligible_file_count,
+        allocation_measured_file_count=(
+            node.allocation_measured_file_count
+        ),
+        identity_measured_file_count=node.identity_measured_file_count,
+        metadata_error_count=node.metadata_error_count,
+        measurement_state=node.measurement_state,
     )
 
 
@@ -189,6 +215,11 @@ def merge_directory_skeleton(
             size_bytes=child_node.total_bytes,
             file_count=child_node.file_count,
             modified_at=child_node.modified_at,
+            allocated_size_bytes=child_node.allocated_size_bytes,
+            unique_allocated_size_bytes=(
+                child_node.unique_allocated_size_bytes
+            ),
+            measurement_state=child_node.measurement_state,
         )
         children = list(parent_node.children)
         for index, item in enumerate(children):
@@ -207,6 +238,20 @@ def merge_directory_skeleton(
             error_count=max(parent_node.error_count + delta_errors, 0),
             modified_at=max(parent_node.modified_at, child_node.modified_at),
             children=tuple(children),
+            allocated_size_bytes=None,
+            unique_allocated_size_bytes=None,
+            measured_allocated_bytes=0,
+            measured_unique_allocated_bytes=0,
+            eligible_file_count=0,
+            allocation_measured_file_count=0,
+            identity_measured_file_count=0,
+            metadata_error_count=0,
+            measurement_state=(
+                "legacy"
+                if parent_node.measurement_state == "legacy"
+                and child_node.measurement_state == "legacy"
+                else "partial"
+            ),
         )
         if parent_path == base_root:
             break

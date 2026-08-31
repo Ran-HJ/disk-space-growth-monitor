@@ -3,10 +3,12 @@ from __future__ import annotations
 import unittest
 from unittest.mock import MagicMock, patch
 
+from disk_monitor.ui import DiskMonitorApp
 from disk_monitor.windows_display import (
     WorkArea,
     clamp_window_position,
     enable_per_monitor_dpi_awareness,
+    position_near_cursor,
     sync_tk_scaling,
 )
 
@@ -35,6 +37,47 @@ class _FakeWindow:
 
     def winfo_fpixels(self, _value: str) -> float:
         return 96.0
+
+
+class _PositionWindow:
+    def __init__(self) -> None:
+        self.geometry_value = ""
+
+    def update_idletasks(self) -> None:
+        pass
+
+    def winfo_reqwidth(self) -> int:
+        return 520
+
+    def winfo_reqheight(self) -> int:
+        return 640
+
+    def geometry(self, value: str) -> None:
+        self.geometry_value = value
+
+
+class _MainWindow:
+    def __init__(self) -> None:
+        self.geometry_value = ""
+        self.minimum_size: tuple[int, int] | None = None
+
+    def title(self, _value: str) -> None:
+        pass
+
+    def geometry(self, value: str) -> None:
+        self.geometry_value = value
+
+    def minsize(self, width: int, height: int) -> None:
+        self.minimum_size = (width, height)
+
+    def configure(self, **_kwargs) -> None:
+        pass
+
+    def iconbitmap(self, **_kwargs) -> None:
+        pass
+
+    def bind(self, *_args, **_kwargs) -> None:
+        pass
 
 
 class WindowsDisplayTests(unittest.TestCase):
@@ -77,6 +120,37 @@ class WindowsDisplayTests(unittest.TestCase):
 
         self.assertEqual(x, -1908)
         self.assertEqual(y, 388)
+
+    @patch(
+        "disk_monitor.windows_display.cursor_work_area",
+        return_value=(-1000, 500, WorkArea(-1920, 0, 0, 1040)),
+    )
+    def test_positions_popup_with_valid_signed_negative_geometry(
+        self, _cursor_work_area
+    ) -> None:
+        window = _PositionWindow()
+
+        position = position_near_cursor(window)
+
+        self.assertEqual(position, (-1496, 12))
+        self.assertEqual(window.geometry_value, "-1496+12")
+
+    @patch(
+        "disk_monitor.ui.cursor_work_area",
+        return_value=(-1500, -500, WorkArea(-1920, -1000, -1024, -300)),
+    )
+    def test_main_window_fits_small_negative_coordinate_work_area(
+        self, _cursor_work_area
+    ) -> None:
+        root = _MainWindow()
+        app = DiskMonitorApp.__new__(DiskMonitorApp)
+        app.root = root
+        app.ui_scale = 1.0
+
+        app._configure_window()
+
+        self.assertEqual(root.geometry_value, "872x676-1908-988")
+        self.assertEqual(root.minimum_size, (872, 676))
 
 
 if __name__ == "__main__":

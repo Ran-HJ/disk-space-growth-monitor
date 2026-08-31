@@ -200,5 +200,5 @@ def position_near_cursor(window: object) -> tuple[int, int]:
         desired_x = cursor_x - width + 24
         desired_y = cursor_y - height + 24
     x, y = clamp_window_position(width, height, desired_x, desired_y, area)
-    window.geometry(f"+{x}+{y}")
+    window.geometry(f"{x:+d}{y:+d}")
     return x, y

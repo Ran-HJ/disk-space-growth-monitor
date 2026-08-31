@@ -35,6 +35,16 @@ def _common_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _add_history_item_filters(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--extension")
+    parser.add_argument("--min-size", type=int)
+    parser.add_argument("--max-size", type=int)
+    parser.add_argument("--modified-after", type=float)
+    parser.add_argument("--modified-before", type=float)
+    parser.add_argument("--limit", type=int, default=100)
+    parser.add_argument("--cursor", type=int, default=0)
+
+
 def build_parser() -> argparse.ArgumentParser:
     common = _common_parser()
     parser = argparse.ArgumentParser(prog="diskmonitor")
@@ -94,6 +104,17 @@ def build_parser() -> argparse.ArgumentParser:
     view_open = view_commands.add_parser("open", parents=[common])
     view_open.add_argument("path")
     view_open.add_argument("--scan-if-missing", action="store_true")
+    view_search = view_commands.add_parser("search", parents=[common])
+    view_search.add_argument("query")
+    view_search.add_argument(
+        "--mode", choices=("prefix", "substring"), default="prefix"
+    )
+    view_search.add_argument(
+        "--kind", choices=("any", "file", "directory"), default="any"
+    )
+    _add_history_item_filters(view_search)
+    view_largest = view_commands.add_parser("largest", parents=[common])
+    _add_history_item_filters(view_largest)
 
     snapshot = groups.add_parser("snapshot")
     snapshot_commands = snapshot.add_subparsers(dest="action", required=True)
@@ -102,6 +123,13 @@ def build_parser() -> argparse.ArgumentParser:
     snapshot_list = snapshot_commands.add_parser("list", parents=[common])
     snapshot_list.add_argument("--limit", type=int, default=200)
     snapshot_list.add_argument("--path")
+    snapshot_list.add_argument(
+        "--source",
+        choices=("baseline", "closing", "manual_save", "manual", "navigation"),
+    )
+    snapshot_list.add_argument("--from", dest="finished_after")
+    snapshot_list.add_argument("--to", dest="finished_before")
+    snapshot_list.add_argument("--cursor", type=int, default=0)
     snapshot_show = snapshot_commands.add_parser("show", parents=[common])
     snapshot_show.add_argument("snapshot_id", type=int)
     snapshot_compare = snapshot_commands.add_parser("compare", parents=[common])
@@ -111,6 +139,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--direction", choices=("increase", "decrease"), default="increase"
     )
     snapshot_compare.add_argument("--limit", type=int, default=100)
+    snapshot_compare.add_argument(
+        "--accounting",
+        action="store_true",
+        help="按稳定文件身份比较分配大小与硬链接归属",
+    )
+    snapshot_compare.add_argument(
+        "--deep", action="store_true", help="按完整目录指标比较当前层级"
+    )
+    snapshot_compare.add_argument("--path")
+    snapshot_search = snapshot_commands.add_parser("search", parents=[common])
+    snapshot_search.add_argument("snapshot_id", type=int)
+    snapshot_search.add_argument("query")
+    snapshot_search.add_argument(
+        "--mode", choices=("prefix", "substring"), default="prefix"
+    )
+    snapshot_search.add_argument(
+        "--kind", choices=("any", "file", "directory"), default="any"
+    )
+    _add_history_item_filters(snapshot_search)
+    snapshot_largest = snapshot_commands.add_parser("largest", parents=[common])
+    snapshot_largest.add_argument("snapshot_id", type=int)
+    _add_history_item_filters(snapshot_largest)
 
     disk = groups.add_parser("disk")
     disk_commands = disk.add_subparsers(dest="action", required=True)
@@ -139,6 +189,16 @@ def build_parser() -> argparse.ArgumentParser:
     tree_snapshot.add_argument("snapshot_id", type=int)
     tree_snapshot.add_argument("--path")
     tree_snapshot.add_argument("--limit", type=int, default=100)
+
+    advice = groups.add_parser("advice")
+    advice_commands = advice.add_subparsers(dest="action", required=True)
+    advice_list = advice_commands.add_parser("list", parents=[common])
+    advice_list.add_argument("--target", required=True)
+    advice_list.add_argument("--snapshot-id", type=int)
+    advice_list.add_argument("--extension")
+    advice_list.add_argument("--min-size", type=int)
+    advice_list.add_argument("--max-size", type=int)
+    advice_list.add_argument("--limit", type=int, default=200)
 
     report = groups.add_parser("report")
     report_commands = report.add_subparsers(dest="action", required=True)
@@ -413,11 +473,33 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
         if args.group == "view":
             if args.action == "current":
                 return _runtime_request(args, "view.current")
-            return _runtime_request(
-                args,
-                "view.open",
-                {"path": args.path, "scan_if_missing": args.scan_if_missing},
-            )
+            if args.action == "open":
+                return _runtime_request(
+                    args,
+                    "view.open",
+                    {"path": args.path, "scan_if_missing": args.scan_if_missing},
+                )
+            filter_args = {
+                "extension": args.extension,
+                "min_size": args.min_size,
+                "max_size": args.max_size,
+                "modified_after": args.modified_after,
+                "modified_before": args.modified_before,
+                "limit": args.limit,
+                "cursor": args.cursor,
+            }
+            if args.action == "search":
+                return _runtime_request(
+                    args,
+                    "search.current",
+                    {
+                        **filter_args,
+                        "query": args.query,
+                        "mode": args.mode,
+                        "kind": args.kind,
+                    },
+                )
+            return _runtime_request(args, "largest.current", filter_args)
         if args.group == "snapshot":
             if args.action == "save":
                 return _runtime_request(
@@ -429,7 +511,12 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
                     request_id,
                     data={
                         "snapshots": database.list_snapshots(
-                            limit=args.limit, root_path=args.path
+                            limit=args.limit,
+                            root_path=args.path,
+                            source=args.source,
+                            finished_after=args.finished_after,
+                            finished_before=args.finished_before,
+                            cursor=args.cursor,
                         )
                     },
                 )
@@ -438,6 +525,61 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 if snapshot is None:
                     return error_response(request_id, "not_found", "快照不存在")
                 return success_response(request_id, data={"snapshot": snapshot})
+            if args.action == "search":
+                return success_response(
+                    request_id,
+                    data=database.search_snapshot(
+                        args.snapshot_id,
+                        args.query,
+                        mode=args.mode,
+                        kind=args.kind,
+                        extension=args.extension,
+                        min_size=args.min_size,
+                        max_size=args.max_size,
+                        modified_after=args.modified_after,
+                        modified_before=args.modified_before,
+                        limit=args.limit,
+                        cursor=args.cursor,
+                    ),
+                )
+            if args.action == "largest":
+                return success_response(
+                    request_id,
+                    data=database.largest_snapshot_files(
+                        args.snapshot_id,
+                        extension=args.extension,
+                        min_size=args.min_size,
+                        max_size=args.max_size,
+                        modified_after=args.modified_after,
+                        modified_before=args.modified_before,
+                        limit=args.limit,
+                        cursor=args.cursor,
+                    ),
+                )
+            if args.deep:
+                if args.accounting:
+                    raise ControlError(
+                        "invalid_args", "--deep 与 --accounting 不能同时使用"
+                    )
+                return success_response(
+                    request_id,
+                    data=database.compare_directory_history(
+                        args.new_snapshot_id,
+                        args.old_snapshot_id,
+                        args.path,
+                        direction=args.direction,
+                        limit=args.limit,
+                    ),
+                )
+            if args.accounting:
+                return success_response(
+                    request_id,
+                    data=database.compare_snapshot_accounting(
+                        args.new_snapshot_id,
+                        args.old_snapshot_id,
+                        limit=args.limit,
+                    ),
+                )
             return success_response(
                 request_id,
                 data=database.compare_snapshots(
@@ -472,6 +614,27 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 request_id,
                 data=_database(args).snapshot_tree(
                     args.snapshot_id, args.path, limit=args.limit
+                ),
+            )
+        if args.group == "advice":
+            advice_args = {
+                "target_path": args.target,
+                "extension": args.extension,
+                "min_size": args.min_size,
+                "max_size": args.max_size,
+                "limit": args.limit,
+            }
+            if args.snapshot_id is None:
+                return _runtime_request(args, "advice.current", advice_args)
+            return success_response(
+                request_id,
+                data=_database(args).migration_advice(
+                    args.snapshot_id,
+                    args.target,
+                    extension=args.extension,
+                    min_size=args.min_size,
+                    max_size=args.max_size,
+                    limit=args.limit,
                 ),
             )
         if args.group == "report":

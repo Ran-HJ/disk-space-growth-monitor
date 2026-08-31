@@ -13,9 +13,219 @@ from disk_monitor.navigation import (
     merge_directory_skeleton,
 )
 from disk_monitor.scanner import scan_path
+from disk_monitor.windows_file_info import FileSpaceInfo
 
 
 class ScannerTests(unittest.TestCase):
+    def test_exclusion_rules_skip_before_accounting_and_are_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            root = base / "root"
+            cache = root / "cache"
+            cache.mkdir(parents=True)
+            (root / "keep.bin").write_bytes(b"k" * 7)
+            (root / "ignored.tmp").write_bytes(b"t" * 11)
+            (cache / "nested.bin").write_bytes(b"n" * 13)
+
+            result = scan_path(
+                str(root),
+                exclude_rules=(str(cache), "*.tmp"),
+            )
+
+        self.assertEqual(result.total_bytes, 7)
+        self.assertEqual(result.file_count, 1)
+        self.assertEqual(result.directory_count, 1)
+        self.assertEqual(result.excluded_rule_count, 2)
+        self.assertEqual(result.excluded_item_count, 2)
+        self.assertIn('"exclude_rules":["path:', result.scan_config_json)
+        self.assertIn('glob:*.tmp', result.scan_config_json)
+
+    def test_invalid_exclusion_rule_identifies_the_line(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            root = base / "root"
+            root.mkdir()
+
+            with self.assertRaisesRegex(ValueError, "第 2 行"):
+                scan_path(
+                    str(root),
+                    exclude_rules=("*.tmp", str(base / "outside")),
+                )
+
+    def test_nested_glob_does_not_exclude_its_literal_prefix_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "root"
+            deep = root / "group" / "deep"
+            deep.mkdir(parents=True)
+            (root / "group" / "keep.bin").write_bytes(b"k" * 7)
+            (deep / "secret.bin").write_bytes(b"s" * 11)
+
+            result = scan_path(
+                str(root), exclude_rules=("group/**/secret.bin",)
+            )
+
+        self.assertEqual(result.total_bytes, 7)
+        self.assertEqual(result.directory_count, 3)
+        self.assertEqual(result.excluded_item_count, 1)
+
+    def test_file_space_accounting_is_opt_in(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "data.bin"
+            path.write_bytes(b"x" * 17)
+
+            result = scan_path(temp_dir)
+
+        self.assertEqual(result.measurement_state, "legacy")
+        self.assertIsNone(result.allocated_total_bytes)
+        self.assertIsNone(result.unique_allocated_total_bytes)
+        self.assertEqual(result.eligible_file_count, 0)
+
+    def test_file_space_metadata_failure_keeps_logical_result(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "data.bin"
+            path.write_bytes(b"x" * 17)
+            unavailable = FileSpaceInfo(
+                None, None, None, None, "inaccessible", 5
+            )
+
+            with patch(
+                "disk_monitor.scanner.read_file_space_info",
+                return_value=unavailable,
+            ):
+                result = scan_path(temp_dir, collect_file_space=True)
+
+        self.assertEqual(result.total_bytes, 17)
+        self.assertEqual(result.file_count, 1)
+        self.assertEqual(result.measurement_state, "unavailable")
+        self.assertIsNone(result.allocated_total_bytes)
+        self.assertIsNone(result.unique_allocated_total_bytes)
+        self.assertEqual(result.metadata_error_count, 1)
+
+    @unittest.skipUnless(os.name == "nt", "仅 Windows 提供硬链接统计")
+    def test_hard_links_have_deterministic_unique_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first_directory = root / "a"
+            later_directory = root / "z"
+            first_directory.mkdir()
+            later_directory.mkdir()
+            original = later_directory / "original.bin"
+            alias = first_directory / "alias.bin"
+            original.write_bytes(b"x" * 8193)
+
+            before_alias = scan_path(
+                temp_dir, record_depth=2, collect_file_space=True
+            )
+            os.link(original, alias)
+            normal = scan_path(
+                temp_dir, record_depth=2, collect_file_space=True
+            )
+
+            real_scandir = os.scandir
+
+            class ReversedScandir:
+                def __init__(self, directory: str) -> None:
+                    self.iterator = real_scandir(directory)
+
+                def __enter__(self):
+                    return iter(reversed(list(self.iterator)))
+
+                def __exit__(self, exc_type, exc_value, traceback) -> None:
+                    del exc_type, exc_value, traceback
+                    self.iterator.close()
+
+            with patch(
+                "disk_monitor.scanner.os.scandir",
+                side_effect=ReversedScandir,
+            ):
+                reversed_result = scan_path(
+                    temp_dir,
+                    record_depth=2,
+                    collect_file_space=True,
+                )
+
+        self.assertEqual(before_alias.measurement_state, "exact")
+        self.assertEqual(normal.measurement_state, "exact")
+        self.assertEqual(reversed_result.measurement_state, "exact")
+        self.assertEqual(normal.total_bytes, 8193 * 2)
+        self.assertEqual(normal.file_count, 2)
+        self.assertEqual(
+            before_alias.unique_allocated_total_bytes,
+            normal.unique_allocated_total_bytes,
+        )
+        self.assertEqual(
+            normal.unique_allocated_total_bytes,
+            reversed_result.unique_allocated_total_bytes,
+        )
+        self.assertIsNotNone(normal.unique_allocated_total_bytes)
+        assert normal.unique_allocated_total_bytes is not None
+        self.assertEqual(
+            normal.allocated_total_bytes,
+            normal.unique_allocated_total_bytes * 2,
+        )
+
+        normal_files = {
+            item.path: item for item in normal.items if item.kind == "file"
+        }
+        reversed_files = {
+            item.path: item
+            for item in reversed_result.items
+            if item.kind == "file"
+        }
+        alias_path = os.path.normcase(os.path.abspath(alias))
+        original_path = os.path.normcase(os.path.abspath(original))
+        self.assertTrue(normal_files[alias_path].is_unique_owner)
+        self.assertFalse(normal_files[original_path].is_unique_owner)
+        self.assertTrue(reversed_files[alias_path].is_unique_owner)
+        self.assertFalse(reversed_files[original_path].is_unique_owner)
+        self.assertEqual(
+            normal_files[alias_path].unique_allocated_size_bytes,
+            normal.unique_allocated_total_bytes,
+        )
+        self.assertEqual(
+            normal_files[original_path].unique_allocated_size_bytes,
+            0,
+        )
+
+        directories = {
+            item.path: item
+            for item in normal.items
+            if item.kind == "directory"
+        }
+        first_path = os.path.normcase(os.path.abspath(first_directory))
+        later_path = os.path.normcase(os.path.abspath(later_directory))
+        self.assertEqual(
+            directories[first_path].unique_allocated_size_bytes,
+            normal.unique_allocated_total_bytes,
+        )
+        self.assertEqual(
+            directories[later_path].unique_allocated_size_bytes,
+            0,
+        )
+        assert normal.skeleton is not None
+        root_navigation = materialize_navigation_result(
+            normal.skeleton, temp_dir
+        )
+        first_navigation = materialize_navigation_result(
+            normal.skeleton, str(first_directory)
+        )
+        later_navigation = materialize_navigation_result(
+            normal.skeleton, str(later_directory)
+        )
+        assert root_navigation is not None
+        assert first_navigation is not None
+        assert later_navigation is not None
+        self.assertEqual(root_navigation.measurement_state, "exact")
+        self.assertEqual(
+            root_navigation.unique_allocated_total_bytes,
+            normal.unique_allocated_total_bytes,
+        )
+        self.assertEqual(
+            first_navigation.unique_allocated_total_bytes,
+            normal.unique_allocated_total_bytes,
+        )
+        self.assertEqual(later_navigation.unique_allocated_total_bytes, 0)
+
     def test_scan_handles_directory_depth_beyond_python_recursion_limit(self) -> None:
         root = os.path.normcase(os.path.abspath("virtual-root"))
         depths = {root: 0}

@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from .accounting import compare_recorded_accounting
 from .models import (
     DiskSample,
     GrowthItem,
@@ -16,6 +17,7 @@ from .models import (
     SessionBoundary,
     SnapshotInfo,
 )
+from .scan_config import compare_scan_configs
 
 
 SNAPSHOT_SOURCES = {
@@ -26,7 +28,46 @@ SNAPSHOT_SOURCES = {
     "manual_save",
 }
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 3
+FULL_DIRECTORY_SOURCES = {"baseline", "closing", "manual_save"}
+V1_BUSINESS_TABLES = (
+    "app_settings",
+    "disk_samples",
+    "monitor_sessions",
+    "session_growth_items",
+    "snapshot_items",
+    "snapshots",
+)
+
+SNAPSHOT_V2_COLUMNS = {
+    "allocated_total_bytes": "INTEGER",
+    "unique_allocated_total_bytes": "INTEGER",
+    "measured_allocated_bytes": "INTEGER NOT NULL DEFAULT 0",
+    "measured_unique_allocated_bytes": "INTEGER NOT NULL DEFAULT 0",
+    "eligible_file_count": "INTEGER NOT NULL DEFAULT 0",
+    "allocation_measured_file_count": "INTEGER NOT NULL DEFAULT 0",
+    "identity_measured_file_count": "INTEGER NOT NULL DEFAULT 0",
+    "metadata_error_count": "INTEGER NOT NULL DEFAULT 0",
+    "measurement_state": "TEXT NOT NULL DEFAULT 'legacy'",
+}
+
+SNAPSHOT_ITEM_V2_COLUMNS = {
+    "allocated_size_bytes": "INTEGER",
+    "unique_allocated_size_bytes": "INTEGER",
+    "volume_serial_hex": "TEXT",
+    "file_id": "BLOB",
+    "link_count": "INTEGER",
+    "is_unique_owner": "INTEGER",
+    "measurement_state": "TEXT NOT NULL DEFAULT 'legacy'",
+}
+
+SNAPSHOT_V3_COLUMNS = {
+    "scan_config_version": "INTEGER NOT NULL DEFAULT 0",
+    "scan_config_json": "TEXT",
+    "directory_summary_state": "TEXT NOT NULL DEFAULT 'legacy'",
+    "excluded_rule_count": "INTEGER NOT NULL DEFAULT 0",
+    "excluded_item_count": "INTEGER NOT NULL DEFAULT 0",
+}
 
 
 def default_database_path() -> Path:
@@ -37,6 +78,7 @@ def default_database_path() -> Path:
 class Storage:
     def __init__(self, database_path: str | Path | None = None) -> None:
         self.database_path = Path(database_path or default_database_path())
+        self.migration_backup_path: Path | None = None
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
@@ -56,6 +98,235 @@ class Storage:
         finally:
             connection.close()
 
+    @staticmethod
+    def _migration_signature(
+        path: Path,
+    ) -> tuple[int, tuple[int, ...], tuple[object, ...]]:
+        uri = f"{path.resolve().as_uri()}?mode=ro"
+        try:
+            connection = sqlite3.connect(uri, uri=True, timeout=30)
+            try:
+                integrity = [
+                    row[0]
+                    for row in connection.execute("PRAGMA integrity_check")
+                ]
+                if integrity != ["ok"]:
+                    raise RuntimeError("数据库完整性检查失败")
+                foreign_key_issues = list(
+                    connection.execute("PRAGMA foreign_key_check")
+                )
+                if foreign_key_issues:
+                    raise RuntimeError("数据库外键检查失败")
+                version = int(
+                    connection.execute("PRAGMA user_version").fetchone()[0]
+                )
+                counts = tuple(
+                    int(
+                        connection.execute(
+                            f'SELECT COUNT(*) FROM "{table}"'
+                        ).fetchone()[0]
+                    )
+                    for table in V1_BUSINESS_TABLES
+                )
+                representative_values = (
+                    connection.execute(
+                        "SELECT MAX(id), MAX(recorded_at) FROM disk_samples"
+                    ).fetchone(),
+                    connection.execute(
+                        "SELECT MAX(id), MAX(finished_at) FROM snapshots"
+                    ).fetchone(),
+                    connection.execute(
+                        "SELECT MAX(snapshot_id), MAX(path) FROM snapshot_items"
+                    ).fetchone(),
+                    connection.execute(
+                        "SELECT MAX(id), MAX(started_at) FROM monitor_sessions"
+                    ).fetchone(),
+                    connection.execute(
+                        "SELECT MAX(session_id), MAX(path) "
+                        "FROM session_growth_items"
+                    ).fetchone(),
+                    connection.execute(
+                        "SELECT MAX(key) FROM app_settings"
+                    ).fetchone(),
+                )
+                return version, counts, tuple(
+                    tuple(row) for row in representative_values
+                )
+            finally:
+                connection.close()
+        except sqlite3.Error as error:
+            raise RuntimeError("无法验证数据库升级备份") from error
+
+    def _ensure_schema_backup(
+        self,
+        *,
+        source_version: int,
+        target_version: int,
+    ) -> Path:
+        source_signature = self._migration_signature(self.database_path)
+        if source_signature[0] != source_version:
+            raise RuntimeError(
+                "数据库升级备份版本不匹配："
+                f"{source_signature[0]} != {source_version}"
+            )
+
+        backup_directory = self.database_path.parent / "backups"
+        backup_directory.mkdir(parents=True, exist_ok=True)
+        backup_prefix = (
+            f"{self.database_path.stem}-v{source_version}-"
+            f"before-v{target_version}"
+        )
+        pattern = f"{backup_prefix}-*.db"
+        for candidate in sorted(
+            backup_directory.glob(pattern),
+            key=lambda path: path.stat().st_mtime_ns,
+            reverse=True,
+        ):
+            try:
+                if self._migration_signature(candidate) == source_signature:
+                    return candidate
+            except RuntimeError:
+                continue
+
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup_path = backup_directory / (
+            f"{backup_prefix}-{timestamp}.db"
+        )
+        suffix = 2
+        while backup_path.exists():
+            backup_path = backup_directory / (
+                f"{backup_prefix}-{timestamp}-{suffix}.db"
+            )
+            suffix += 1
+        partial_path = backup_path.with_suffix(".db.partial")
+        partial_path.unlink(missing_ok=True)
+        try:
+            source_uri = f"{self.database_path.resolve().as_uri()}?mode=ro"
+            source = sqlite3.connect(source_uri, uri=True, timeout=30)
+            destination = sqlite3.connect(partial_path, timeout=30)
+            try:
+                source.backup(destination)
+            finally:
+                destination.close()
+                source.close()
+            if self._migration_signature(partial_path) != source_signature:
+                raise RuntimeError("数据库升级备份与源库记录不一致")
+            partial_path.replace(backup_path)
+            return backup_path
+        except Exception:
+            partial_path.unlink(missing_ok=True)
+            raise
+
+    def _ensure_pre_v2_backup(self) -> Path:
+        return self._ensure_schema_backup(source_version=1, target_version=2)
+
+    def _ensure_pre_v3_backup(self) -> Path:
+        return self._ensure_schema_backup(source_version=2, target_version=3)
+
+    def _apply_schema_v2(
+        self,
+        connection: sqlite3.Connection,
+        backup_path: Path | None,
+    ) -> None:
+        snapshot_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(snapshots)")
+        }
+        if "note" not in snapshot_columns:
+            connection.execute("ALTER TABLE snapshots ADD COLUMN note TEXT")
+        if "source" not in snapshot_columns:
+            connection.execute("ALTER TABLE snapshots ADD COLUMN source TEXT")
+        for name, definition in SNAPSHOT_V2_COLUMNS.items():
+            if name not in snapshot_columns:
+                connection.execute(
+                    f"ALTER TABLE snapshots ADD COLUMN {name} {definition}"
+                )
+
+        item_columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(snapshot_items)"
+            )
+        }
+        for name, definition in SNAPSHOT_ITEM_V2_COLUMNS.items():
+            if name not in item_columns:
+                connection.execute(
+                    "ALTER TABLE snapshot_items "
+                    f"ADD COLUMN {name} {definition}"
+                )
+        if backup_path is not None:
+            connection.execute(
+                """
+                INSERT INTO app_settings(key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                ("schema_v2_backup_path", str(backup_path)),
+            )
+
+    def _apply_schema_v3(
+        self,
+        connection: sqlite3.Connection,
+        backup_path: Path | None,
+    ) -> None:
+        snapshot_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(snapshots)")
+        }
+        for name, definition in SNAPSHOT_V3_COLUMNS.items():
+            if name not in snapshot_columns:
+                connection.execute(
+                    f"ALTER TABLE snapshots ADD COLUMN {name} {definition}"
+                )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS directory_paths (
+                id INTEGER PRIMARY KEY,
+                path TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                parent_id INTEGER REFERENCES directory_paths(id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_directory_paths_parent
+                ON directory_paths(parent_id, path)
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS snapshot_directory_metrics (
+                snapshot_id INTEGER NOT NULL REFERENCES snapshots(id)
+                    ON DELETE CASCADE,
+                path_id INTEGER NOT NULL REFERENCES directory_paths(id),
+                total_bytes INTEGER NOT NULL,
+                allocated_size_bytes INTEGER,
+                unique_allocated_size_bytes INTEGER,
+                measured_allocated_bytes INTEGER NOT NULL DEFAULT 0,
+                measured_unique_allocated_bytes INTEGER NOT NULL DEFAULT 0,
+                file_count INTEGER NOT NULL,
+                directory_count INTEGER NOT NULL,
+                direct_file_bytes INTEGER NOT NULL,
+                direct_file_count INTEGER NOT NULL,
+                eligible_file_count INTEGER NOT NULL DEFAULT 0,
+                allocation_measured_file_count INTEGER NOT NULL DEFAULT 0,
+                identity_measured_file_count INTEGER NOT NULL DEFAULT 0,
+                metadata_error_count INTEGER NOT NULL DEFAULT 0,
+                error_count INTEGER NOT NULL,
+                modified_at REAL NOT NULL,
+                measurement_state TEXT NOT NULL,
+                PRIMARY KEY(snapshot_id, path_id)
+            ) WITHOUT ROWID
+            """
+        )
+        if backup_path is not None:
+            connection.execute(
+                """
+                INSERT INTO app_settings(key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                ("schema_v3_backup_path", str(backup_path)),
+            )
+
     def _initialize(self) -> None:
         probe = sqlite3.connect(self.database_path, timeout=30)
         try:
@@ -69,6 +340,11 @@ class Storage:
                 "数据库版本高于当前程序支持的版本："
                 f"{schema_version} > {CURRENT_SCHEMA_VERSION}"
             )
+
+        if schema_version == 1:
+            self.migration_backup_path = self._ensure_pre_v2_backup()
+        elif schema_version == 2:
+            self.migration_backup_path = self._ensure_pre_v3_backup()
 
         with self._connection() as connection:
             connection.executescript(
@@ -94,7 +370,16 @@ class Storage:
                     directory_count INTEGER NOT NULL,
                     error_count INTEGER NOT NULL,
                     note TEXT,
-                    source TEXT
+                    source TEXT,
+                    allocated_total_bytes INTEGER,
+                    unique_allocated_total_bytes INTEGER,
+                    measured_allocated_bytes INTEGER NOT NULL DEFAULT 0,
+                    measured_unique_allocated_bytes INTEGER NOT NULL DEFAULT 0,
+                    eligible_file_count INTEGER NOT NULL DEFAULT 0,
+                    allocation_measured_file_count INTEGER NOT NULL DEFAULT 0,
+                    identity_measured_file_count INTEGER NOT NULL DEFAULT 0,
+                    metadata_error_count INTEGER NOT NULL DEFAULT 0,
+                    measurement_state TEXT NOT NULL DEFAULT 'legacy'
                 );
                 CREATE INDEX IF NOT EXISTS idx_snapshots_root_time
                     ON snapshots(root_path, finished_at);
@@ -110,6 +395,13 @@ class Storage:
                     file_count INTEGER NOT NULL,
                     depth INTEGER NOT NULL,
                     modified_at REAL NOT NULL,
+                    allocated_size_bytes INTEGER,
+                    unique_allocated_size_bytes INTEGER,
+                    volume_serial_hex TEXT,
+                    file_id BLOB,
+                    link_count INTEGER,
+                    is_unique_owner INTEGER,
+                    measurement_state TEXT NOT NULL DEFAULT 'legacy',
                     PRIMARY KEY(snapshot_id, path)
                 );
                 CREATE INDEX IF NOT EXISTS idx_items_snapshot_parent
@@ -151,15 +443,22 @@ class Storage:
                 );
                 """
             )
-            snapshot_columns = {
-                row["name"]
-                for row in connection.execute("PRAGMA table_info(snapshots)")
-            }
-            if "note" not in snapshot_columns:
-                connection.execute("ALTER TABLE snapshots ADD COLUMN note TEXT")
-            if "source" not in snapshot_columns:
-                connection.execute("ALTER TABLE snapshots ADD COLUMN source TEXT")
-            connection.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._apply_schema_v2(
+                    connection,
+                    self.migration_backup_path if schema_version == 1 else None,
+                )
+                self._apply_schema_v3(
+                    connection, self.migration_backup_path
+                )
+                connection.execute(
+                    f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
 
     def add_disk_sample(self, sample: DiskSample) -> None:
         with self._connection() as connection:
@@ -292,6 +591,56 @@ class Storage:
             )
             return cursor.rowcount
 
+    def prune_directory_metrics(self, *, now: datetime | None = None) -> int:
+        reference_time = now or datetime.now()
+        baseline_cutoff = (reference_time - timedelta(days=7)).isoformat(
+            timespec="seconds"
+        )
+        closing_cutoff = (reference_time - timedelta(days=30)).isoformat(
+            timespec="seconds"
+        )
+        manual_cutoff = (reference_time - timedelta(days=90)).isoformat(
+            timespec="seconds"
+        )
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM snapshot_directory_metrics
+                WHERE snapshot_id IN (
+                    SELECT s.id
+                    FROM snapshots AS s
+                    WHERE (
+                        (s.source = 'baseline' AND s.finished_at < ?)
+                        OR (s.source = 'closing' AND s.finished_at < ?)
+                        OR (s.source = 'manual_save' AND s.finished_at < ?)
+                    )
+                    AND s.id NOT IN (
+                        SELECT start_snapshot_id FROM monitor_sessions
+                        WHERE status = 'active'
+                          AND start_snapshot_id IS NOT NULL
+                    )
+                    AND s.id NOT IN (
+                        SELECT end_snapshot_id FROM monitor_sessions
+                        WHERE status = 'active'
+                          AND end_snapshot_id IS NOT NULL
+                    )
+                )
+                """,
+                (baseline_cutoff, closing_cutoff, manual_cutoff),
+            )
+            connection.execute(
+                """
+                UPDATE snapshots
+                SET directory_summary_state = 'expired'
+                WHERE directory_summary_state = 'complete'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM snapshot_directory_metrics AS metrics
+                      WHERE metrics.snapshot_id = snapshots.id
+                  )
+                """
+            )
+            return cursor.rowcount
+
     def get_setting(self, key: str, default: str = "") -> str:
         with self._connection() as connection:
             row = connection.execute(
@@ -309,6 +658,138 @@ class Storage:
                 (key, value),
             )
 
+    @staticmethod
+    def _directory_summary_state(result: ScanResult, source: str | None) -> str:
+        if source not in FULL_DIRECTORY_SOURCES:
+            return "not_saved"
+        if (
+            result.skeleton is None
+            or len(result.skeleton.nodes) != result.directory_count
+        ):
+            return "unavailable"
+        return "complete"
+
+    @staticmethod
+    def _save_directory_metrics(
+        connection: sqlite3.Connection,
+        snapshot_id: int,
+        result: ScanResult,
+    ) -> None:
+        skeleton = result.skeleton
+        if skeleton is None:
+            raise ValueError("目录骨架不可用")
+        connection.execute("DROP TABLE IF EXISTS temp.pending_directory_metrics")
+        connection.execute(
+            """
+            CREATE TEMP TABLE pending_directory_metrics (
+                path TEXT NOT NULL COLLATE NOCASE PRIMARY KEY,
+                parent_path TEXT COLLATE NOCASE,
+                total_bytes INTEGER NOT NULL,
+                allocated_size_bytes INTEGER,
+                unique_allocated_size_bytes INTEGER,
+                measured_allocated_bytes INTEGER NOT NULL,
+                measured_unique_allocated_bytes INTEGER NOT NULL,
+                file_count INTEGER NOT NULL,
+                directory_count INTEGER NOT NULL,
+                direct_file_bytes INTEGER NOT NULL,
+                direct_file_count INTEGER NOT NULL,
+                eligible_file_count INTEGER NOT NULL,
+                allocation_measured_file_count INTEGER NOT NULL,
+                identity_measured_file_count INTEGER NOT NULL,
+                metadata_error_count INTEGER NOT NULL,
+                error_count INTEGER NOT NULL,
+                modified_at REAL NOT NULL,
+                measurement_state TEXT NOT NULL
+            ) WITHOUT ROWID
+            """
+        )
+        connection.executemany(
+            """
+            INSERT INTO pending_directory_metrics(
+                path, parent_path, total_bytes, allocated_size_bytes,
+                unique_allocated_size_bytes, measured_allocated_bytes,
+                measured_unique_allocated_bytes, file_count,
+                directory_count, direct_file_bytes, direct_file_count,
+                eligible_file_count, allocation_measured_file_count,
+                identity_measured_file_count, metadata_error_count,
+                error_count, modified_at, measurement_state
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    path,
+                    None if path == result.root_path else os.path.dirname(path),
+                    node.total_bytes,
+                    node.allocated_size_bytes,
+                    node.unique_allocated_size_bytes,
+                    node.measured_allocated_bytes,
+                    node.measured_unique_allocated_bytes,
+                    node.file_count,
+                    node.directory_count,
+                    node.direct_file_bytes,
+                    node.direct_file_count,
+                    node.eligible_file_count,
+                    node.allocation_measured_file_count,
+                    node.identity_measured_file_count,
+                    node.metadata_error_count,
+                    node.error_count,
+                    node.modified_at,
+                    node.measurement_state,
+                )
+                for path, node in skeleton.nodes.items()
+            ),
+        )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO directory_paths(path)
+            SELECT path FROM pending_directory_metrics
+            """
+        )
+        connection.execute(
+            """
+            UPDATE directory_paths
+            SET parent_id = (
+                SELECT parent.id
+                FROM pending_directory_metrics AS pending
+                LEFT JOIN directory_paths AS parent
+                    ON parent.path = pending.parent_path COLLATE NOCASE
+                WHERE pending.path = directory_paths.path COLLATE NOCASE
+            )
+            WHERE path IN (SELECT path FROM pending_directory_metrics)
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO snapshot_directory_metrics(
+                snapshot_id, path_id, total_bytes,
+                allocated_size_bytes, unique_allocated_size_bytes,
+                measured_allocated_bytes, measured_unique_allocated_bytes,
+                file_count, directory_count, direct_file_bytes,
+                direct_file_count, eligible_file_count,
+                allocation_measured_file_count,
+                identity_measured_file_count, metadata_error_count,
+                error_count, modified_at, measurement_state
+            )
+            SELECT ?, paths.id, pending.total_bytes,
+                   pending.allocated_size_bytes,
+                   pending.unique_allocated_size_bytes,
+                   pending.measured_allocated_bytes,
+                   pending.measured_unique_allocated_bytes,
+                   pending.file_count, pending.directory_count,
+                   pending.direct_file_bytes, pending.direct_file_count,
+                   pending.eligible_file_count,
+                   pending.allocation_measured_file_count,
+                   pending.identity_measured_file_count,
+                   pending.metadata_error_count, pending.error_count,
+                   pending.modified_at, pending.measurement_state
+            FROM pending_directory_metrics AS pending
+            JOIN directory_paths AS paths
+                ON paths.path = pending.path COLLATE NOCASE
+            """,
+            (snapshot_id,),
+        )
+        connection.execute("DROP TABLE pending_directory_metrics")
+
     def save_scan(
         self,
         result: ScanResult,
@@ -318,13 +799,24 @@ class Storage:
     ) -> int:
         if source is not None and source not in SNAPSHOT_SOURCES:
             raise ValueError(f"未知快照来源：{source}")
+        directory_summary_state = self._directory_summary_state(result, source)
         with self._connection() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO snapshots(
                     root_path, started_at, finished_at, total_bytes,
-                    file_count, directory_count, error_count, note, source
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    file_count, directory_count, error_count, note, source,
+                    allocated_total_bytes, unique_allocated_total_bytes,
+                    measured_allocated_bytes, measured_unique_allocated_bytes,
+                    eligible_file_count, allocation_measured_file_count,
+                    identity_measured_file_count, metadata_error_count,
+                    measurement_state, scan_config_version, scan_config_json,
+                    directory_summary_state, excluded_rule_count,
+                    excluded_item_count
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?
+                )
                 """,
                 (
                     result.root_path,
@@ -336,6 +828,20 @@ class Storage:
                     result.error_count,
                     note.strip() if note and note.strip() else None,
                     source,
+                    result.allocated_total_bytes,
+                    result.unique_allocated_total_bytes,
+                    result.measured_allocated_bytes,
+                    result.measured_unique_allocated_bytes,
+                    result.eligible_file_count,
+                    result.allocation_measured_file_count,
+                    result.identity_measured_file_count,
+                    result.metadata_error_count,
+                    result.measurement_state,
+                    result.scan_config_version,
+                    result.scan_config_json,
+                    directory_summary_state,
+                    result.excluded_rule_count,
+                    result.excluded_item_count,
                 ),
             )
             snapshot_id = int(cursor.lastrowid)
@@ -343,8 +849,10 @@ class Storage:
                 """
                 INSERT INTO snapshot_items(
                     snapshot_id, path, parent_path, name, kind, size_bytes,
-                    file_count, depth, modified_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    file_count, depth, modified_at, allocated_size_bytes,
+                    unique_allocated_size_bytes, volume_serial_hex, file_id,
+                    link_count, is_unique_owner, measurement_state
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -357,10 +865,23 @@ class Storage:
                         item.file_count,
                         item.depth,
                         item.modified_at,
+                        item.allocated_size_bytes,
+                        item.unique_allocated_size_bytes,
+                        item.volume_serial_hex,
+                        item.file_id,
+                        item.link_count,
+                        (
+                            int(item.is_unique_owner)
+                            if item.is_unique_owner is not None
+                            else None
+                        ),
+                        item.measurement_state,
                     )
                     for item in result.items
                 ],
             )
+            if directory_summary_state == "complete":
+                self._save_directory_metrics(connection, snapshot_id, result)
         result.snapshot_id = snapshot_id
         return snapshot_id
 
@@ -374,7 +895,9 @@ class Storage:
             rows = connection.execute(
                 """
                 SELECT path, parent_path, name, kind, size_bytes, file_count,
-                       depth, modified_at
+                       depth, modified_at, allocated_size_bytes,
+                       unique_allocated_size_bytes, volume_serial_hex, file_id,
+                       link_count, is_unique_owner, measurement_state
                 FROM snapshot_items
                 WHERE snapshot_id = ?
                 ORDER BY path
@@ -399,10 +922,44 @@ class Storage:
                     file_count=row["file_count"],
                     depth=row["depth"],
                     modified_at=row["modified_at"],
+                    allocated_size_bytes=row["allocated_size_bytes"],
+                    unique_allocated_size_bytes=(
+                        row["unique_allocated_size_bytes"]
+                    ),
+                    volume_serial_hex=row["volume_serial_hex"],
+                    file_id=row["file_id"],
+                    link_count=row["link_count"],
+                    is_unique_owner=(
+                        bool(row["is_unique_owner"])
+                        if row["is_unique_owner"] is not None
+                        else None
+                    ),
+                    measurement_state=row["measurement_state"],
                 )
                 for row in rows
             ],
             snapshot_id=snapshot_id,
+            allocated_total_bytes=snapshot["allocated_total_bytes"],
+            unique_allocated_total_bytes=(
+                snapshot["unique_allocated_total_bytes"]
+            ),
+            measured_allocated_bytes=snapshot["measured_allocated_bytes"],
+            measured_unique_allocated_bytes=(
+                snapshot["measured_unique_allocated_bytes"]
+            ),
+            eligible_file_count=snapshot["eligible_file_count"],
+            allocation_measured_file_count=(
+                snapshot["allocation_measured_file_count"]
+            ),
+            identity_measured_file_count=(
+                snapshot["identity_measured_file_count"]
+            ),
+            metadata_error_count=snapshot["metadata_error_count"],
+            measurement_state=snapshot["measurement_state"],
+            scan_config_version=snapshot["scan_config_version"],
+            scan_config_json=snapshot["scan_config_json"],
+            excluded_rule_count=snapshot["excluded_rule_count"],
+            excluded_item_count=snapshot["excluded_item_count"],
         )
 
     def latest_snapshot_id(self, root_path: str) -> int | None:
@@ -492,18 +1049,42 @@ class Storage:
         *,
         limit: int = 200,
         cursor: tuple[datetime, int] | None = None,
+        root_path: str | None = None,
+        source: str | None = None,
+        finished_after: datetime | None = None,
+        finished_before: datetime | None = None,
     ) -> list[SnapshotInfo]:
         if limit < 1:
             raise ValueError("limit 必须至少为 1")
+        if source is not None and source not in SNAPSHOT_SOURCES:
+            raise ValueError(f"未知快照来源：{source}")
+        if (
+            finished_after is not None
+            and finished_before is not None
+            and finished_after > finished_before
+        ):
+            raise ValueError("开始时间不能晚于结束时间")
         parameters: list[object] = []
-        cursor_clause = ""
+        conditions: list[str] = []
         if cursor is not None:
             cursor_time = cursor[0].isoformat(timespec="seconds")
-            cursor_clause = """
-                WHERE s.finished_at < ?
-                   OR (s.finished_at = ? AND s.id < ?)
-            """
+            conditions.append(
+                "(s.finished_at < ? OR (s.finished_at = ? AND s.id < ?))"
+            )
             parameters.extend((cursor_time, cursor_time, cursor[1]))
+        if root_path:
+            conditions.append("s.root_path = ? COLLATE NOCASE")
+            parameters.append(os.path.normcase(os.path.abspath(root_path)))
+        if source is not None:
+            conditions.append(f"({self._snapshot_source_sql()}) = ?")
+            parameters.append(source)
+        if finished_after is not None:
+            conditions.append("s.finished_at >= ?")
+            parameters.append(finished_after.isoformat(timespec="seconds"))
+        if finished_before is not None:
+            conditions.append("s.finished_at <= ?")
+            parameters.append(finished_before.isoformat(timespec="seconds"))
+        where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
         parameters.append(limit)
         with self._connection() as connection:
             rows = connection.execute(
@@ -512,7 +1093,7 @@ class Storage:
                        COALESCE(s.note, '') AS note,
                        {self._snapshot_source_sql()} AS effective_source
                 FROM snapshots AS s
-                {cursor_clause}
+                {where_clause}
                 ORDER BY s.finished_at DESC, s.id DESC
                 LIMIT ?
                 """,
@@ -558,11 +1139,51 @@ class Storage:
                 """
                 SELECT id FROM snapshots
                 WHERE root_path = ? AND id < ?
+                  AND (
+                      (? <= 0 AND scan_config_version <= 0)
+                      OR (
+                          scan_config_version = ?
+                          AND scan_config_json = ?
+                      )
+                  )
                 ORDER BY id DESC LIMIT 1
                 """,
-                (result.root_path, result.snapshot_id),
+                (
+                    result.root_path,
+                    result.snapshot_id,
+                    result.scan_config_version,
+                    result.scan_config_version,
+                    result.scan_config_json,
+                ),
             ).fetchone()
         return int(row["id"]) if row else None
+
+    def snapshot_config_comparison(
+        self, new_snapshot_id: int, old_snapshot_id: int
+    ) -> dict[str, object]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, root_path, scan_config_version, scan_config_json
+                FROM snapshots WHERE id IN (?, ?)
+                """,
+                (new_snapshot_id, old_snapshot_id),
+            ).fetchall()
+        snapshots = {int(row["id"]): row for row in rows}
+        if new_snapshot_id not in snapshots or old_snapshot_id not in snapshots:
+            raise ValueError("指定的快照不存在")
+        new_snapshot = snapshots[new_snapshot_id]
+        old_snapshot = snapshots[old_snapshot_id]
+        if os.path.normcase(new_snapshot["root_path"]) != os.path.normcase(
+            old_snapshot["root_path"]
+        ):
+            raise ValueError("只能比较相同路径的快照")
+        return compare_scan_configs(
+            new_snapshot["scan_config_version"],
+            new_snapshot["scan_config_json"],
+            old_snapshot["scan_config_version"],
+            old_snapshot["scan_config_json"],
+        )
 
     def compare_snapshots(
         self, new_snapshot_id: int, old_snapshot_id: int, limit: int = 100
@@ -574,6 +1195,66 @@ class Storage:
             limit=limit,
         )
 
+    def compare_snapshot_accounting(
+        self,
+        new_snapshot_id: int,
+        old_snapshot_id: int,
+        *,
+        limit: int = 100,
+    ) -> dict[str, object]:
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise ValueError("limit 必须是正整数")
+        with self._connection() as connection:
+            snapshots = {
+                int(row["id"]): row
+                for row in connection.execute(
+                    """
+                    SELECT id, root_path, total_bytes,
+                           allocated_total_bytes,
+                           unique_allocated_total_bytes,
+                           measurement_state
+                    FROM snapshots WHERE id IN (?, ?)
+                    """,
+                    (new_snapshot_id, old_snapshot_id),
+                )
+            }
+            if (
+                new_snapshot_id not in snapshots
+                or old_snapshot_id not in snapshots
+            ):
+                raise ValueError("指定的快照不存在")
+            rows = {
+                new_snapshot_id: connection.execute(
+                    """
+                    SELECT path, kind, allocated_size_bytes,
+                           volume_serial_hex, file_id, link_count,
+                           is_unique_owner, measurement_state
+                    FROM snapshot_items WHERE snapshot_id = ?
+                    """,
+                    (new_snapshot_id,),
+                ).fetchall(),
+                old_snapshot_id: connection.execute(
+                    """
+                    SELECT path, kind, allocated_size_bytes,
+                           volume_serial_hex, file_id, link_count,
+                           is_unique_owner, measurement_state
+                    FROM snapshot_items WHERE snapshot_id = ?
+                    """,
+                    (old_snapshot_id,),
+                ).fetchall(),
+            }
+        result = compare_recorded_accounting(
+            snapshots[new_snapshot_id],
+            snapshots[old_snapshot_id],
+            rows[new_snapshot_id],
+            rows[old_snapshot_id],
+        )
+        result["item_count"] = len(result["items"])
+        result["unresolved_item_count"] = len(result["unresolved_items"])
+        result["items"] = result["items"][:limit]
+        result["unresolved_items"] = result["unresolved_items"][:limit]
+        return result
+
     def compare_snapshot_changes(
         self,
         new_snapshot_id: int,
@@ -584,6 +1265,12 @@ class Storage:
     ) -> list[GrowthItem]:
         if direction not in {"increase", "decrease"}:
             raise ValueError("direction 必须是 increase 或 decrease")
+        config_comparison = self.snapshot_config_comparison(
+            new_snapshot_id, old_snapshot_id
+        )
+        if config_comparison["status"] == "mismatch":
+            differences = "、".join(config_comparison["differences"])
+            raise ValueError(f"扫描配置不同，不能生成增长归因：{differences}")
         comparator = ">" if direction == "increase" else "<"
         with self._connection() as connection:
             rows = connection.execute(

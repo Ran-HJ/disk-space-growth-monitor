@@ -1,5 +1,6 @@
 param(
     [string]$ExePath = "",
+    [string]$CliExePath = "",
     [ValidateSet("quick", "full", "low")]
     [string]$CloseBehavior = "quick"
 )
@@ -7,13 +8,21 @@ param(
 $ErrorActionPreference = "Stop"
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
-$defaultExePath = Join-Path $projectRoot "dist\disk-space-growth-monitor-v0.7.5.exe"
+$defaultExePath = Join-Path $projectRoot "dist\disk-space-growth-monitor-v0.8.1.exe"
+$defaultCliExePath = Join-Path $projectRoot "dist\diskmonitor-cli-v0.8.1.exe"
 $exePath = if ([string]::IsNullOrWhiteSpace($ExePath)) {
     $defaultExePath
 } elseif ([System.IO.Path]::IsPathRooted($ExePath)) {
     [System.IO.Path]::GetFullPath($ExePath)
 } else {
     [System.IO.Path]::GetFullPath((Join-Path $projectRoot $ExePath))
+}
+$cliExePath = if ([string]::IsNullOrWhiteSpace($CliExePath)) {
+    $defaultCliExePath
+} elseif ([System.IO.Path]::IsPathRooted($CliExePath)) {
+    [System.IO.Path]::GetFullPath($CliExePath)
+} else {
+    [System.IO.Path]::GetFullPath((Join-Path $projectRoot $CliExePath))
 }
 $pythonPath = Join-Path $projectRoot ".venv\Scripts\python.exe"
 $tempBase = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
@@ -41,6 +50,11 @@ New-Item -ItemType Directory -Path (Join-Path $scanRoot "second") | Out-Null
     (Join-Path $scanRoot "second\beta.bin"),
     [byte[]]::new(8192)
 )
+New-Item `
+    -ItemType HardLink `
+    -Path (Join-Path $scanRoot "second\alpha-link.bin") `
+    -Target (Join-Path $scanRoot "first\alpha.bin") |
+    Out-Null
 $env:LOCALAPPDATA = $smokeRoot
 $env:DISK_GROWTH_MONITOR_INITIAL_PATH = $scanRoot
 $env:DISK_GROWTH_MONITOR_INSTANCE_NAME = (
@@ -50,7 +64,7 @@ $env:DISK_GROWTH_MONITOR_INSTANCE_NAME = (
 try {
     $runMode = if ($CloseBehavior -eq "low") { "low_memory" } else { "full" }
     $storedCloseBehavior = if ($CloseBehavior -eq "low") { "ask" } else { $CloseBehavior }
-    & $pythonPath -c "from disk_monitor.storage import Storage; s=Storage(); s.set_setting('close_behavior', '$storedCloseBehavior'); s.set_setting('run_mode', '$runMode')"
+    & $pythonPath -c "from disk_monitor.storage import Storage; s=Storage(); s.set_setting('close_behavior', '$storedCloseBehavior'); s.set_setting('run_mode', '$runMode'); s.set_setting('file_space_accounting', 'exact')"
 
     $launcher = Start-Process `
         -FilePath $exePath `
@@ -132,6 +146,10 @@ try {
             }
             throw "EXE 未在 30 秒内完成启动基线和非空矩形图。状态：$baselineState`n$logTail"
         }
+        $accountingState = & $pythonPath -c "import sqlite3; from disk_monitor.storage import default_database_path; c=sqlite3.connect(default_database_path()); version=c.execute('pragma user_version').fetchone()[0]; snapshot=c.execute('select measurement_state, allocated_total_bytes, unique_allocated_total_bytes from snapshots order by id desc limit 1').fetchone(); links=c.execute('select sum(case when link_count >= 2 then 1 else 0 end), sum(case when link_count >= 2 and is_unique_owner = 1 then 1 else 0 end), sum(case when link_count >= 2 and is_unique_owner = 0 then 1 else 0 end) from snapshot_items').fetchone(); print(f'{version}:{snapshot[0]}:{int(snapshot[1] is not None)}:{int(snapshot[2] is not None)}:{links[0] or 0}:{links[1] or 0}:{links[2] or 0}'); c.close()"
+        if ($accountingState -ne "3:exact:1:1:2:1:1") {
+            throw "v0.8.1 精确统计、schema v3 或硬链接唯一归属异常：$accountingState"
+        }
     }
 
     if (-not $windowProcess.CloseMainWindow()) {
@@ -185,6 +203,15 @@ try {
     if ($CloseBehavior -eq "low") {
         Write-Host "EXE 低内存冷启动、无地址快照与 low_memory_close 冒烟测试通过。"
     } else {
+        $databasePath = Join-Path $smokeRoot "DiskGrowthMonitor\monitor.db"
+        $cliOutput = & $cliExePath snapshot list --limit 5 --database $databasePath --json
+        if ($LASTEXITCODE -ne 0) {
+            throw "打包 CLI 无法只读查询 schema v3 数据库：$cliOutput"
+        }
+        $cliResult = $cliOutput | ConvertFrom-Json
+        if (-not $cliResult.ok -or $cliResult.data.snapshots.Count -lt 1) {
+            throw "打包 CLI 未返回 schema v3 快照。"
+        }
         Write-Host "EXE 启动基线、非空矩形图与 $CloseBehavior 关闭冒烟测试通过。"
     }
 }

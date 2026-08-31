@@ -21,7 +21,13 @@ class ControlTransportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             control_directory = Path(temp_dir)
             stale = control_directory / ("control-" + "0" * 32 + ".auth")
+            stale_auth_temp = control_directory / (
+                ".control-" + "0" * 32 + ".auth.tmp"
+            )
+            stale_endpoint_temp = control_directory / ".control.endpoint.json.tmp"
             stale.write_bytes(b"stale")
+            stale_auth_temp.write_bytes(b"stale")
+            stale_endpoint_temp.write_bytes(b"stale")
             server = ControlServer(
                 control_directory,
                 lambda request: success_response(request["request_id"]),
@@ -29,6 +35,8 @@ class ControlTransportTests(unittest.TestCase):
             try:
                 server.start()
                 self.assertFalse(stale.exists())
+                self.assertFalse(stale_auth_temp.exists())
+                self.assertFalse(stale_endpoint_temp.exists())
                 self.assertTrue(server.auth_path.exists())
             finally:
                 server.stop()

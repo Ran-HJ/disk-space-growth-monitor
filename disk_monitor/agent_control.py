@@ -13,6 +13,7 @@ from .control_protocol import (
     utc_timestamp,
 )
 from .models import DiskSample, GrowthItem, ScanItem, ScanProgress, ScanResult
+from .migration_advice import build_migration_advice
 
 if TYPE_CHECKING:
     from .ui import DiskMonitorApp
@@ -47,6 +48,13 @@ def _scan_item_data(item: ScanItem) -> dict[str, Any]:
         "file_count": item.file_count,
         "depth": item.depth,
         "modified_at": item.modified_at,
+        "allocated_size_bytes": item.allocated_size_bytes,
+        "unique_allocated_size_bytes": item.unique_allocated_size_bytes,
+        "volume_serial_hex": item.volume_serial_hex,
+        "file_id_hex": item.file_id.hex() if item.file_id is not None else None,
+        "link_count": item.link_count,
+        "is_unique_owner": item.is_unique_owner,
+        "measurement_state": item.measurement_state,
     }
 
 
@@ -74,7 +82,30 @@ def _scan_result_data(result: ScanResult | None) -> dict[str, Any] | None:
         "file_count": result.file_count,
         "directory_count": result.directory_count,
         "error_count": result.error_count,
+        "scan_config_version": result.scan_config_version,
+        "scan_config_json": result.scan_config_json,
+        "excluded_rule_count": result.excluded_rule_count,
+        "excluded_item_count": result.excluded_item_count,
         "skeleton_degraded": bool(result.skeleton and result.skeleton.degraded),
+        "accounting": {
+            "measurement_state": result.measurement_state,
+            "allocated_total_bytes": result.allocated_total_bytes,
+            "unique_allocated_total_bytes": (
+                result.unique_allocated_total_bytes
+            ),
+            "measured_allocated_bytes": result.measured_allocated_bytes,
+            "measured_unique_allocated_bytes": (
+                result.measured_unique_allocated_bytes
+            ),
+            "eligible_file_count": result.eligible_file_count,
+            "allocation_measured_file_count": (
+                result.allocation_measured_file_count
+            ),
+            "identity_measured_file_count": (
+                result.identity_measured_file_count
+            ),
+            "metadata_error_count": result.metadata_error_count,
+        },
     }
 
 
@@ -110,6 +141,9 @@ class GuiAgentController:
                 "session.current": self._session_current,
                 "growth.current": self._growth_current,
                 "tree.current": self._tree_current,
+                "search.current": self._search_current,
+                "largest.current": self._largest_current,
+                "advice.current": self._advice_current,
             }
             handler = handlers.get(command)
             if handler is None:
@@ -306,7 +340,11 @@ class GuiAgentController:
         self._require_idle_scan()
         normalized = self._normalize_existing_directory(path)
         self._create_task(request_id, role, normalized)
-        self.app._start_scan(role=role, path=normalized)
+        try:
+            self.app._start_scan(role=role, path=normalized)
+        except Exception as error:
+            self._fail_task(request_id, str(error) or "扫描启动失败")
+            raise
         if self.app.active_scan_role != role:
             self._fail_task(request_id, "扫描未能启动")
             raise ControlError("scan_failed", "扫描未能启动")
@@ -389,9 +427,6 @@ class GuiAgentController:
         scan_if_missing = args.get("scan_if_missing", False)
         if not isinstance(scan_if_missing, bool):
             raise ControlError("invalid_args", "scan_if_missing 必须是布尔值")
-        self.app.nav_stack = self.app._path_chain(path)
-        self.app.path_var.set(path)
-        self.app._refresh_breadcrumbs()
         result = self.app._navigation_result_from_skeleton(path)
         source = "memory_skeleton"
         if result is None:
@@ -408,6 +443,9 @@ class GuiAgentController:
                     self.app.nav_cache[path] = result
                     source = "history_snapshot"
         if result is not None:
+            self.app.nav_stack = self.app._path_chain(path)
+            self.app.path_var.set(path)
+            self.app._refresh_breadcrumbs()
             self.app._show_navigation_result(result, "Agent 查询")
             return success_response(
                 request_id,
@@ -415,7 +453,12 @@ class GuiAgentController:
             )
         if not scan_if_missing:
             raise ControlError("not_found", "没有该目录的可用明细；可显式允许扫描")
-        return self._start_task_scan(request_id, role="navigation", path=path)
+        response = self._start_task_scan(
+            request_id, role="navigation", path=path
+        )
+        self.app.nav_stack = self.app._path_chain(path)
+        self.app._refresh_breadcrumbs()
+        return response
 
     def _snapshot_save(self, request_id: str, args: dict[str, Any]) -> dict[str, Any]:
         note = args.get("note")
@@ -517,6 +560,233 @@ class GuiAgentController:
                 "items": [_scan_item_data(item) for item in items[:limit]],
             },
         )
+
+    @staticmethod
+    def _current_query_options(args: dict[str, Any]) -> dict[str, Any]:
+        limit = args.get("limit", 100)
+        cursor = args.get("cursor", 0)
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise ControlError("invalid_args", "limit 必须是正整数")
+        if not isinstance(cursor, int) or isinstance(cursor, bool) or cursor < 0:
+            raise ControlError("invalid_args", "cursor 必须是非负整数")
+        kind = args.get("kind", "any")
+        if kind not in {"any", "file", "directory"}:
+            raise ControlError("invalid_args", "kind 必须是 any、file 或 directory")
+        extension = args.get("extension")
+        if extension is not None:
+            if not isinstance(extension, str) or not extension.strip():
+                raise ControlError("invalid_args", "extension 必须是非空字符串")
+            extension = extension.strip().lower()
+            if not extension.startswith("."):
+                extension = "." + extension
+            if any(character in extension for character in "*?%_"):
+                raise ControlError("invalid_args", "extension 不能包含通配符")
+        values: dict[str, int | float | None] = {}
+        for name in (
+            "min_size",
+            "max_size",
+            "modified_after",
+            "modified_before",
+        ):
+            value = args.get(name)
+            if value is not None and (
+                not isinstance(value, (int, float)) or isinstance(value, bool)
+            ):
+                raise ControlError("invalid_args", f"{name} 必须是数字")
+            values[name] = value
+        if values["min_size"] is not None and values["min_size"] < 0:
+            raise ControlError("invalid_args", "min_size 不能为负数")
+        if values["max_size"] is not None and values["max_size"] < 0:
+            raise ControlError("invalid_args", "max_size 不能为负数")
+        if (
+            values["min_size"] is not None
+            and values["max_size"] is not None
+            and values["min_size"] > values["max_size"]
+        ):
+            raise ControlError("invalid_args", "min_size 不能大于 max_size")
+        if (
+            values["modified_after"] is not None
+            and values["modified_before"] is not None
+            and values["modified_after"] > values["modified_before"]
+        ):
+            raise ControlError(
+                "invalid_args", "modified_after 不能晚于 modified_before"
+            )
+        return {
+            "limit": limit,
+            "cursor": cursor,
+            "kind": kind,
+            "extension": extension,
+            **values,
+        }
+
+    def _current_search_source(self) -> tuple[ScanResult, list[dict[str, Any]]]:
+        result = self.app.current_result
+        if result is None:
+            raise ControlError("not_found", "当前没有扫描结果")
+        items = [
+            _scan_item_data(item)
+            for item in result.items
+            if item.kind == "file"
+        ]
+        if result.skeleton is not None:
+            for path, node in result.skeleton.nodes.items():
+                items.append(
+                    {
+                        "path": path,
+                        "parent_path": os.path.dirname(path),
+                        "name": os.path.basename(path.rstrip("\\/")) or path,
+                        "kind": "directory",
+                        "size_bytes": node.total_bytes,
+                        "file_count": node.file_count,
+                        "depth": None,
+                        "modified_at": node.modified_at,
+                        "allocated_size_bytes": node.allocated_size_bytes,
+                        "unique_allocated_size_bytes": (
+                            node.unique_allocated_size_bytes
+                        ),
+                        "volume_serial_hex": None,
+                        "file_id_hex": None,
+                        "link_count": None,
+                        "is_unique_owner": None,
+                        "measurement_state": node.measurement_state,
+                    }
+                )
+        else:
+            items.extend(
+                _scan_item_data(item)
+                for item in result.items
+                if item.kind == "directory"
+            )
+        return result, items
+
+    @staticmethod
+    def _filter_current_items(
+        items: list[dict[str, Any]], options: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        filtered = []
+        for item in items:
+            if options["kind"] != "any" and item["kind"] != options["kind"]:
+                continue
+            if options["extension"] is not None and (
+                item["kind"] != "file"
+                or not item["path"].lower().endswith(options["extension"])
+            ):
+                continue
+            if (
+                options["min_size"] is not None
+                and item["size_bytes"] < options["min_size"]
+            ):
+                continue
+            if (
+                options["max_size"] is not None
+                and item["size_bytes"] > options["max_size"]
+            ):
+                continue
+            if (
+                options["modified_after"] is not None
+                and item["modified_at"] < options["modified_after"]
+            ):
+                continue
+            if (
+                options["modified_before"] is not None
+                and item["modified_at"] > options["modified_before"]
+            ):
+                continue
+            filtered.append(item)
+        filtered.sort(key=lambda item: (-item["size_bytes"], item["path"]))
+        return filtered
+
+    def _search_current(
+        self, request_id: str, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        options = self._current_query_options(args)
+        query = args.get("query")
+        mode = args.get("mode", "prefix")
+        if not isinstance(query, str) or not query.strip():
+            raise ControlError("invalid_args", "搜索内容不能为空")
+        if mode not in {"prefix", "substring"}:
+            raise ControlError("invalid_args", "mode 必须是 prefix 或 substring")
+        query = query.strip()
+        if mode == "substring" and len(query) < 3:
+            raise ControlError("invalid_args", "子串搜索至少需要 3 个字符")
+        result, items = self._current_search_source()
+        if mode == "prefix":
+            search_path = query if os.path.isabs(query) else os.path.join(
+                result.root_path, query
+            )
+            normalized_query = os.path.normcase(os.path.abspath(search_path))
+            items = [
+                item
+                for item in items
+                if os.path.normcase(os.path.abspath(item["path"])).startswith(
+                    normalized_query
+                )
+            ]
+        else:
+            folded_query = query.casefold()
+            items = [
+                item for item in items if folded_query in item["path"].casefold()
+            ]
+        items = self._filter_current_items(items, options)
+        start = options["cursor"]
+        end = start + options["limit"]
+        return success_response(
+            request_id,
+            data={
+                "snapshot_id": result.snapshot_id,
+                "query": query,
+                "mode": mode,
+                "items": items[start:end],
+                "cursor": start,
+                "next_cursor": end if end < len(items) else None,
+                "coverage": (
+                    "目录来自当前导航骨架；文件受 Top N 和明细预算限制"
+                ),
+            },
+        )
+
+    def _largest_current(
+        self, request_id: str, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        options = self._current_query_options({**args, "kind": "file"})
+        result, items = self._current_search_source()
+        items = self._filter_current_items(items, options)
+        start = options["cursor"]
+        end = start + options["limit"]
+        return success_response(
+            request_id,
+            data={
+                "snapshot_id": result.snapshot_id,
+                "items": items[start:end],
+                "cursor": start,
+                "next_cursor": end if end < len(items) else None,
+                "coverage": "仅覆盖当前扫描 Top N 和明细预算内文件",
+            },
+        )
+
+    def _advice_current(
+        self, request_id: str, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        result = self.app.current_result
+        if result is None:
+            raise ControlError("not_found", "当前没有扫描结果")
+        target_path = args.get("target_path")
+        if not isinstance(target_path, str) or not target_path.strip():
+            raise ControlError("invalid_args", "必须明确指定目标盘路径")
+        limit = self._positive_limit(args)
+        advice = build_migration_advice(
+            result.items,
+            target_path,
+            active_data_directory=self.app.storage.database_path.parent,
+            extension=args.get("extension"),
+            min_size=args.get("min_size"),
+            max_size=args.get("max_size"),
+            limit=limit,
+            inspection_limit=min(max(limit * 5, limit), 1_000),
+        )
+        advice["snapshot_id"] = result.snapshot_id
+        return success_response(request_id, data=advice)
 
     def _create_task(self, request_id: str, role: str, path: str) -> None:
         now = utc_timestamp()

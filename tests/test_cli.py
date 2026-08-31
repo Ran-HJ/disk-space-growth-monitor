@@ -100,6 +100,98 @@ class CliTests(unittest.TestCase):
             self.assertEqual(growth_response["data"]["session"]["change_bytes"], 30)
             self.assertEqual(growth_response["data"]["items"][0]["change_bytes"], 15)
 
+    def test_snapshot_accounting_compare_reports_legacy_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = self.create_history(Path(temp_dir))
+            snapshots = Storage(database_path).list_snapshots()
+
+            code, output, _ = self.run_cli(
+                [
+                    "snapshot",
+                    "compare",
+                    str(snapshots[0].id),
+                    str(snapshots[1].id),
+                    "--accounting",
+                    "--database",
+                    str(database_path),
+                    "--json",
+                ]
+            )
+
+        response = json.loads(output)
+        self.assertEqual(code, 0)
+        self.assertTrue(response["ok"])
+        self.assertFalse(response["data"]["available"])
+        self.assertEqual(
+            response["data"]["reason"],
+            "measurement_coverage_incomplete",
+        )
+
+    def test_snapshot_search_and_largest_are_bounded_read_only_queries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = self.create_history(Path(temp_dir))
+
+            search_code, search_output, _ = self.run_cli(
+                [
+                    "snapshot",
+                    "search",
+                    "2",
+                    "data.bin",
+                    "--mode",
+                    "substring",
+                    "--limit",
+                    "1",
+                    "--database",
+                    str(database_path),
+                    "--json",
+                ]
+            )
+            largest_code, largest_output, _ = self.run_cli(
+                [
+                    "snapshot",
+                    "largest",
+                    "2",
+                    "--limit",
+                    "1",
+                    "--database",
+                    str(database_path),
+                    "--json",
+                ]
+            )
+
+        search_response = json.loads(search_output)
+        largest_response = json.loads(largest_output)
+        self.assertEqual(search_code, 0)
+        self.assertEqual(largest_code, 0)
+        self.assertEqual(search_response["data"]["items"][0]["name"], "data.bin")
+        self.assertEqual(largest_response["data"]["items"][0]["name"], "data.bin")
+        self.assertIn("Top N", largest_response["data"]["coverage"])
+
+    def test_snapshot_migration_advice_has_notice_and_no_action_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            database_path = self.create_history(base)
+
+            code, output, _ = self.run_cli(
+                [
+                    "advice",
+                    "list",
+                    "--snapshot-id",
+                    "2",
+                    "--target",
+                    str(base),
+                    "--database",
+                    str(database_path),
+                    "--json",
+                ]
+            )
+
+        response = json.loads(output)
+        self.assertEqual(code, 0)
+        self.assertTrue(response["ok"])
+        self.assertIn("不会移动或修改文件", response["data"]["notice"])
+        self.assertNotIn("action", response["data"])
+
     def test_runtime_mode_command_is_sent_to_gui(self) -> None:
         client = Mock()
         client.request.return_value = success_response(

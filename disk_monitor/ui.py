@@ -5,6 +5,7 @@ import gc
 import logging
 import os
 import queue
+import sqlite3
 import sys
 import threading
 import tkinter as tk
@@ -26,6 +27,8 @@ from .automation import (
 )
 from .autostart import is_autostart_enabled, set_autostart
 from .control_bridge import GuiControlBridge
+from .control_protocol import ControlError
+from .exclusions import compile_exclusion_rules
 from .formatting import format_bytes
 from .growth_tree import GrowthTreeNode, build_growth_tree
 from .models import (
@@ -39,11 +42,13 @@ from .models import (
     SessionBoundary,
     SnapshotInfo,
 )
+from .migration_advice import SAFETY_NOTICE, build_migration_advice
 from .navigation import (
     NAVIGATION_MEMORY_BUDGET_BYTES,
     materialize_navigation_result,
     merge_directory_skeleton,
 )
+from .readonly import ReadOnlyDatabase
 from .scanner import ScanCancelled, scan_path
 from .service import (
     calculate_blind_spot,
@@ -105,6 +110,23 @@ RUN_MODE_LOW_MEMORY = "low_memory"
 RUN_MODE_LABELS = {
     RUN_MODE_FULL: "全功能模式",
     RUN_MODE_LOW_MEMORY: "低内存模式",
+}
+
+MIGRATION_REASON_LABELS = {
+    "directory": "目录不作为文件迁移建议",
+    "system_root": "系统盘根目录文件",
+    "system_or_app_data": "系统或应用数据目录",
+    "app_managed_type": "应用管理或系统文件类型",
+    "target_same_volume": "目标盘与源卷相同",
+    "identity_incomplete": "文件身份或唯一归属不完整",
+    "hard_link": "硬链接文件",
+    "missing": "文件已不存在",
+    "permission_denied": "权限不足",
+    "metadata_unavailable": "当前元数据不可读取",
+    "reparse_point": "重解析点",
+    "cloud_or_offline": "云占位或离线文件",
+    "not_regular_file": "不是普通文件",
+    "snapshot_mismatch": "当前文件与快照不一致",
 }
 
 AUTO_RESCAN_LABELS = {
@@ -197,6 +219,10 @@ class DiskMonitorApp:
     ) -> None:
         self.root = root
         self.storage = storage or Storage()
+        self.collect_file_space = (
+            self.storage.get_setting("file_space_accounting", "logical")
+            == "exact"
+        )
         stored_run_mode = self.storage.get_setting("run_mode", RUN_MODE_FULL)
         self.run_mode = (
             stored_run_mode
@@ -262,6 +288,11 @@ class DiskMonitorApp:
         self.session_start_sample: DiskSample | None = None
         self.latest_disk_sample: DiskSample | None = None
         self.session_root_path = requested_path
+        self.exclude_rules = tuple(
+            line.strip()
+            for line in self.storage.get_setting("exclude_rules", "").splitlines()
+            if line.strip()
+        )
         self.session_start_snapshot_id: int | None = None
         self.session_finished = False
         self.closing = False
@@ -284,7 +315,6 @@ class DiskMonitorApp:
         self.low_memory_started_at: datetime | None = None
         self.low_memory_start_sample: DiskSample | None = None
         self.low_memory_reference_snapshot_id: int | None = None
-        self.low_memory_reference_finished_at: datetime | None = None
         self.cold_low_memory_baseline_pending = False
         self.test_low_after_baseline = (
             os.environ.get("DISK_GROWTH_MONITOR_TEST_LOW_AFTER_BASELINE") == "1"
@@ -306,6 +336,8 @@ class DiskMonitorApp:
         self.display_after_id: str | None = None
         self.display_sync_window: tk.Misc | None = None
         self.settings_window: tk.Toplevel | None = None
+        self.migration_window: tk.Toplevel | None = None
+        self.snapshot_browser_window: tk.Toplevel | None = None
         self.nav_stack = self._path_chain(requested_path)
         self.nav_cache: dict[str, ScanResult] = {}
         self.nav_invalidated_roots: set[str] = set()
@@ -334,6 +366,10 @@ class DiskMonitorApp:
         self.blind_spot_var = tk.StringVar(value="等待首次磁盘采样")
         self.low_memory_change_var = tk.StringVar(value="尚未进入低内存模式")
         self.history_status_var = tk.StringVar(value="请选择两条同路径快照进行对比")
+        self.history_path_filter_var = tk.StringVar()
+        self.history_source_filter_var = tk.StringVar(value="全部来源")
+        self.history_after_filter_var = tk.StringVar()
+        self.history_before_filter_var = tk.StringVar()
         self.trend_range_var = tk.StringVar(value="24 小时")
         self.trend_title_var = tk.StringVar(value="最近 24 小时已用空间")
         self.trend_hover_var = tk.StringVar(value="悬停趋势线查看精确数值")
@@ -726,13 +762,13 @@ class DiskMonitorApp:
             work_width = work_area.right - work_area.left
             work_height = work_area.bottom - work_area.top
         edge_margin = self._px(24)
-        width = min(self._px(1180), max(self._px(900), work_width - edge_margin))
-        height = min(self._px(780), max(self._px(720), work_height - edge_margin))
+        width = max(1, min(self._px(1180), work_width - edge_margin))
+        height = max(1, min(self._px(780), work_height - edge_margin))
         minimum_width = min(self._px(900), width)
         minimum_height = min(self._px(720), height)
         x = work_left + max(0, (work_width - width) // 2)
         y = work_top + max(0, (work_height - height) // 2)
-        self.root.geometry(f"{width}x{height}+{x}+{y}")
+        self.root.geometry(f"{width}x{height}{x:+d}{y:+d}")
         self.root.minsize(minimum_width, minimum_height)
         self.root.configure(bg=COLORS["background"])
         bundle_root = Path(
@@ -745,6 +781,32 @@ class DiskMonitorApp:
         self.root.bind("<Map>", self._on_window_visibility_changed, add="+")
         self.root.bind("<Unmap>", self._on_window_visibility_changed, add="+")
         self.root.bind("<Configure>", self._schedule_display_sync, add="+")
+
+    def _configure_dialog_window(
+        self,
+        window: tk.Toplevel,
+        *,
+        width: int,
+        height: int,
+        minimum_width: int,
+        minimum_height: int,
+    ) -> None:
+        cursor = cursor_work_area()
+        if cursor is None:
+            work_width = window.winfo_screenwidth()
+            work_height = window.winfo_screenheight()
+        else:
+            _cursor_x, _cursor_y, work_area = cursor
+            work_width = work_area.right - work_area.left
+            work_height = work_area.bottom - work_area.top
+        edge_margin = self._px(24)
+        actual_width = max(1, min(self._px(width), work_width - edge_margin))
+        actual_height = max(1, min(self._px(height), work_height - edge_margin))
+        window.geometry(f"{actual_width}x{actual_height}")
+        window.minsize(
+            min(self._px(minimum_width), actual_width),
+            min(self._px(minimum_height), actual_height),
+        )
 
     def _px(self, value: int) -> int:
         return max(1, round(value * self.ui_scale))
@@ -1032,6 +1094,20 @@ class DiskMonitorApp:
             controls, text="保存快照", command=self._save_marked_snapshot
         )
         self.save_snapshot_button.pack(side=tk.LEFT, padx=(8, 0))
+        self.migration_advice_button = ttk.Button(
+            controls,
+            text="迁移建议",
+            command=self._open_migration_advice,
+            state=tk.DISABLED,
+        )
+        self.migration_advice_button.pack(side=tk.LEFT, padx=(8, 0))
+        self.search_filter_button = ttk.Button(
+            controls,
+            text="查找/筛选",
+            command=self._open_current_snapshot_browser,
+            state=tk.DISABLED,
+        )
+        self.search_filter_button.pack(side=tk.LEFT, padx=(8, 0))
         self.settings_button = ttk.Button(
             controls, text="设置", command=self._open_settings
         )
@@ -1298,6 +1374,45 @@ class DiskMonitorApp:
             state=tk.DISABLED,
         )
         self.compare_history_button.pack(side=tk.RIGHT)
+        self.view_history_button = ttk.Button(
+            history_header,
+            text="查看/查找所选项",
+            command=self._open_selected_snapshot_browser,
+            state=tk.DISABLED,
+        )
+        self.view_history_button.pack(side=tk.RIGHT, padx=(0, 8))
+        history_filters = ttk.Frame(self.history_tab, padding=(0, 0, 0, 8))
+        history_filters.pack(fill=tk.X)
+        ttk.Label(history_filters, text="根路径").pack(side=tk.LEFT)
+        ttk.Entry(
+            history_filters, textvariable=self.history_path_filter_var, width=28
+        ).pack(side=tk.LEFT, padx=(5, 10))
+        ttk.Label(history_filters, text="来源").pack(side=tk.LEFT)
+        ttk.Combobox(
+            history_filters,
+            textvariable=self.history_source_filter_var,
+            values=("全部来源", *SNAPSHOT_SOURCE_LABELS.values()),
+            state="readonly",
+            width=10,
+        ).pack(side=tk.LEFT, padx=(5, 10))
+        ttk.Label(history_filters, text="从").pack(side=tk.LEFT)
+        ttk.Entry(
+            history_filters, textvariable=self.history_after_filter_var, width=12
+        ).pack(side=tk.LEFT, padx=(5, 6))
+        ttk.Label(history_filters, text="到").pack(side=tk.LEFT)
+        ttk.Entry(
+            history_filters, textvariable=self.history_before_filter_var, width=12
+        ).pack(side=tk.LEFT, padx=(5, 8))
+        ttk.Button(
+            history_filters,
+            text="应用筛选",
+            command=lambda: self._load_snapshot_history(reset=True),
+        ).pack(side=tk.LEFT)
+        ttk.Label(
+            history_filters,
+            text="日期格式 YYYY-MM-DD",
+            foreground=COLORS["muted"],
+        ).pack(side=tk.LEFT, padx=(10, 0))
         ttk.Label(
             self.history_tab,
             textvariable=self.history_status_var,
@@ -1531,7 +1646,7 @@ class DiskMonitorApp:
         data_time = result.finished_at.strftime("%Y-%m-%d %H:%M:%S")
         self.status_var.set(f"已从{source}载入 · 数据时间 {data_time}")
         self.detail_var.set(
-            f"{result.root_path} · {format_bytes(result.total_bytes)} · "
+            f"{result.root_path} · {self._result_space_text(result)} · "
             f"{result.file_count:,} 个文件 · 数据时间 {data_time}"
         )
         self._refresh_context_status()
@@ -1571,9 +1686,7 @@ class DiskMonitorApp:
             )
         )
 
-    def _select_low_memory_reference(
-        self,
-    ) -> tuple[int | None, datetime | None]:
+    def _select_low_memory_reference(self) -> int | None:
         session_root = self._normalize_path(self.session_root_path)
         for snapshot_id in (
             self.automatic_current_snapshot_id,
@@ -1586,19 +1699,25 @@ class DiskMonitorApp:
                 info is not None
                 and self._normalize_path(info.root_path) == session_root
             ):
-                return info.id, info.finished_at
-        return None, None
+                return info.id
+        return None
 
-    def _request_run_mode(self, requested_mode: str) -> bool:
+    def _request_run_mode(
+        self,
+        requested_mode: str,
+        *,
+        parent: tk.Misc | None = None,
+    ) -> bool:
         if requested_mode not in RUN_MODE_LABELS:
             raise ValueError(f"未知运行模式：{requested_mode}")
         if requested_mode == self.run_mode:
             return True
+        dialog_parent = parent or self.root
         if self.session_id is None or self.session_start_sample is None:
             messagebox.showinfo(
                 "正在初始化",
                 "请等待首次磁盘采样完成后再切换运行模式。",
-                parent=self.root,
+                parent=dialog_parent,
             )
             return False
         if requested_mode == RUN_MODE_LOW_MEMORY:
@@ -1608,13 +1727,13 @@ class DiskMonitorApp:
                 messagebox.showinfo(
                     "扫描进行中",
                     "请等待当前扫描结束，或先取消扫描，再切换低内存模式。",
-                    parent=self.root,
+                    parent=dialog_parent,
                 )
                 return False
             self._enter_low_memory_mode()
             self._note_manual_mode_change("gui")
             return True
-        switched = self._leave_low_memory_mode()
+        switched = self._leave_low_memory_mode(parent=dialog_parent)
         if switched:
             self._note_manual_mode_change("gui")
         return switched
@@ -1628,7 +1747,7 @@ class DiskMonitorApp:
         self._request_run_mode(requested_mode)
 
     def _enter_low_memory_mode(self) -> None:
-        reference_id, reference_finished_at = self._select_low_memory_reference()
+        reference_id = self._select_low_memory_reference()
         try:
             sample = self._record_mode_boundary_sample()
         except Exception as error:
@@ -1650,7 +1769,6 @@ class DiskMonitorApp:
         self.low_memory_started_at = sample.recorded_at
         self.low_memory_start_sample = sample
         self.low_memory_reference_snapshot_id = reference_id
-        self.low_memory_reference_finished_at = reference_finished_at
         self.run_mode = RUN_MODE_LOW_MEMORY
         self.storage.set_setting("run_mode", self.run_mode)
         self._release_full_mode_state()
@@ -1665,15 +1783,19 @@ class DiskMonitorApp:
         self._update_tray_state()
 
     def _leave_low_memory_mode(
-        self, *, should_scan: bool | None = None
+        self,
+        *,
+        should_scan: bool | None = None,
+        parent: tk.Misc | None = None,
     ) -> bool:
+        dialog_parent = parent or self.root
         cold_start = self.low_memory_origin == "cold"
         if cold_start:
             if should_scan is None:
                 messagebox.showinfo(
                     "建立文件基线",
                     "此前只有磁盘口径记录，无文件地址明细；本次建立新基线。",
-                    parent=self.root,
+                    parent=dialog_parent,
                 )
                 should_scan = True
         elif should_scan is None:
@@ -1681,7 +1803,7 @@ class DiskMonitorApp:
                 "切回全功能模式",
                 "是否立即扫描当前监控路径并重建空间分布？\n\n"
                 "是：立即补扫；否：只切换模式，稍后手动扫描；取消：保持低内存模式。",
-                parent=self.root,
+                parent=dialog_parent,
             )
             if answer is None:
                 return False
@@ -1788,6 +1910,20 @@ class DiskMonitorApp:
         )
         self.scan_button.configure(state=control_state)
         self.save_snapshot_button.configure(state=control_state)
+        self.migration_advice_button.configure(
+            state=(
+                tk.NORMAL
+                if self.current_result is not None and not self.closing
+                else tk.DISABLED
+            )
+        )
+        self.search_filter_button.configure(
+            state=(
+                tk.NORMAL
+                if self.current_result is not None and not self.closing
+                else tk.DISABLED
+            )
+        )
         self.choose_directory_button.configure(state=control_state)
         self.path_entry.configure(state=control_state)
         self.cancel_button.configure(state=tk.DISABLED)
@@ -1902,6 +2038,38 @@ class DiskMonitorApp:
             variable=autostart_var,
             style="Panel.TCheckbutton",
         ).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(10, 0))
+        file_space_var = tk.BooleanVar(value=self.collect_file_space)
+        ttk.Checkbutton(
+            general_panel,
+            text="扫描时读取分配大小与硬链接（精确但明显更慢）",
+            variable=file_space_var,
+            style="Panel.TCheckbutton",
+        ).grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(10, 0))
+        ttk.Label(
+            general_panel,
+            text="默认关闭；只影响保存设置后的新扫描",
+            style="PanelMuted.TLabel",
+        ).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(3, 0))
+        ttk.Label(
+            general_panel,
+            text="扫描排除规则",
+            background=COLORS["panel"],
+        ).grid(row=6, column=0, sticky=tk.NW, padx=(0, 18), pady=(12, 4))
+        exclude_rules_text = tk.Text(
+            general_panel,
+            width=34,
+            height=4,
+            wrap="none",
+            relief=tk.SOLID,
+            borderwidth=1,
+        )
+        exclude_rules_text.grid(row=6, column=1, sticky=tk.EW, pady=(12, 4))
+        exclude_rules_text.insert("1.0", "\n".join(self.exclude_rules))
+        ttk.Label(
+            general_panel,
+            text="逐行填写扫描根内绝对路径或相对 glob；默认不排除任何目录",
+            style="PanelMuted.TLabel",
+        ).grid(row=7, column=0, columnspan=2, sticky=tk.W, pady=(0, 2))
 
         automation_panel = ttk.Frame(body, style="Panel.TFrame", padding=16)
         automation_panel.pack(fill=tk.X, pady=(12, 0))
@@ -2007,6 +2175,14 @@ class DiskMonitorApp:
                 if label == run_mode_var.get()
             )
             try:
+                requested_exclude_rules = tuple(
+                    line.strip()
+                    for line in exclude_rules_text.get("1.0", "end").splitlines()
+                    if line.strip()
+                )
+                compile_exclusion_rules(
+                    self.session_root_path, list(requested_exclude_rules)
+                )
                 auto_config = AutoModeConfig(
                     enabled=auto_enabled_var.get(),
                     process_names=normalize_process_names(
@@ -2024,10 +2200,19 @@ class DiskMonitorApp:
             except (ValueError, StopIteration) as error:
                 messagebox.showerror("设置无效", str(error), parent=window)
                 return
-            if not self._request_run_mode(requested_mode):
+            if not self._request_run_mode(requested_mode, parent=window):
                 return
             try:
                 self.storage.set_setting("close_behavior", behavior)
+                self.collect_file_space = file_space_var.get()
+                self.storage.set_setting(
+                    "file_space_accounting",
+                    "exact" if self.collect_file_space else "logical",
+                )
+                self.exclude_rules = requested_exclude_rules
+                self.storage.set_setting(
+                    "exclude_rules", "\n".join(self.exclude_rules)
+                )
                 set_autostart(autostart_var.get())
                 self._apply_automation_config(auto_config)
             except (OSError, ValueError) as error:
@@ -2065,6 +2250,610 @@ class DiskMonitorApp:
                 window.grab_release()
         except tk.TclError:
             pass
+        try:
+            if window.winfo_exists():
+                window.destroy()
+        except tk.TclError:
+            pass
+
+    def _open_migration_advice(self) -> None:
+        if self.current_result is None:
+            messagebox.showinfo("迁移建议", "当前没有可用的扫描结果", parent=self.root)
+            return
+        if self.migration_window is not None:
+            try:
+                if self.migration_window.winfo_exists():
+                    self.migration_window.deiconify()
+                    self.migration_window.lift()
+                    self.migration_window.focus_force()
+                    return
+            except tk.TclError:
+                pass
+            self.migration_window = None
+
+        window = tk.Toplevel(self.root)
+        self.migration_window = window
+        window.title("C 盘空间增长监控器 · 迁移建议")
+        self._configure_dialog_window(
+            window,
+            width=980,
+            height=680,
+            minimum_width=820,
+            minimum_height=560,
+        )
+        window.configure(bg=COLORS["background"])
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(3, weight=1)
+        if self.app_icon_path.exists():
+            window.iconbitmap(default=str(self.app_icon_path))
+        if self._window_is_visible():
+            window.transient(self.root)
+
+        header = ttk.Frame(window, padding=(18, 16, 18, 10))
+        header.grid(row=0, column=0, sticky=tk.EW)
+        ttk.Label(header, text="迁移建议视图", style="DialogTitle.TLabel").pack(
+            anchor=tk.W
+        )
+        ttk.Label(
+            header,
+            text=SAFETY_NOTICE,
+            style="Subtitle.TLabel",
+            wraplength=900,
+        ).pack(anchor=tk.W, pady=(4, 0))
+
+        filters = ttk.Frame(window, style="Panel.TFrame", padding=12)
+        filters.grid(row=1, column=0, sticky=tk.EW, padx=18)
+        self.migration_target_var = tk.StringVar()
+        self.migration_extension_var = tk.StringVar()
+        self.migration_min_mb_var = tk.StringVar(value="0")
+        ttk.Label(filters, text="目标盘", background=COLORS["panel"]).grid(
+            row=0, column=0, sticky=tk.W
+        )
+        target_entry = ttk.Entry(
+            filters, textvariable=self.migration_target_var, state="readonly"
+        )
+        target_entry.grid(row=0, column=1, sticky=tk.EW, padx=(8, 8))
+
+        def choose_target() -> None:
+            selected = filedialog.askdirectory(
+                parent=window,
+                title="选择用于空间估算的目标盘或目录",
+                mustexist=True,
+            )
+            if selected:
+                self.migration_target_var.set(selected)
+
+        ttk.Button(filters, text="选择目标盘", command=choose_target).grid(
+            row=0, column=2, padx=(0, 14)
+        )
+        ttk.Label(filters, text="扩展名", background=COLORS["panel"]).grid(
+            row=0, column=3, sticky=tk.W
+        )
+        ttk.Entry(
+            filters, textvariable=self.migration_extension_var, width=9
+        ).grid(row=0, column=4, padx=(6, 14))
+        ttk.Label(filters, text="最小 MB", background=COLORS["panel"]).grid(
+            row=0, column=5, sticky=tk.W
+        )
+        ttk.Entry(filters, textvariable=self.migration_min_mb_var, width=8).grid(
+            row=0, column=6, padx=(6, 10)
+        )
+        filters.columnconfigure(1, weight=1)
+
+        self.migration_status_var = tk.StringVar(
+            value="请选择目标盘，然后刷新建议。空间为读取时的即时值。"
+        )
+        ttk.Label(
+            window,
+            textvariable=self.migration_status_var,
+            style="Subtitle.TLabel",
+            padding=(18, 10, 18, 8),
+        ).grid(row=2, column=0, sticky=tk.EW)
+
+        results = ttk.Panedwindow(window, orient=tk.VERTICAL)
+        results.grid(
+            row=3,
+            column=0,
+            sticky=tk.NSEW,
+            padx=18,
+            pady=(0, 10),
+        )
+        candidate_panel = ttk.Labelframe(results, text="可考虑迁移")
+        excluded_panel = ttk.Labelframe(results, text="保守排除说明")
+        results.add(candidate_panel, weight=1)
+        results.add(excluded_panel, weight=1)
+        self.migration_candidate_tree = ttk.Treeview(
+            candidate_panel,
+            columns=("logical", "estimate", "basis"),
+            show="tree headings",
+            height=8,
+        )
+        self.migration_candidate_tree.heading("#0", text="完整路径")
+        self.migration_candidate_tree.heading("logical", text="逻辑大小")
+        self.migration_candidate_tree.heading("estimate", text="估算占用")
+        self.migration_candidate_tree.heading("basis", text="估算依据")
+        self.migration_candidate_tree.column("#0", width=560, stretch=True)
+        self.migration_candidate_tree.column("logical", width=110, anchor=tk.E)
+        self.migration_candidate_tree.column("estimate", width=110, anchor=tk.E)
+        self.migration_candidate_tree.column("basis", width=130)
+        self.migration_candidate_tree.pack(fill=tk.BOTH, expand=True)
+        self.migration_excluded_tree = ttk.Treeview(
+            excluded_panel,
+            columns=("logical", "reason"),
+            show="tree headings",
+            height=8,
+        )
+        self.migration_excluded_tree.heading("#0", text="完整路径")
+        self.migration_excluded_tree.heading("logical", text="逻辑大小")
+        self.migration_excluded_tree.heading("reason", text="排除原因")
+        self.migration_excluded_tree.column("#0", width=520, stretch=True)
+        self.migration_excluded_tree.column("logical", width=110, anchor=tk.E)
+        self.migration_excluded_tree.column("reason", width=300)
+        self.migration_excluded_tree.pack(fill=tk.BOTH, expand=True)
+
+        footer = ttk.Frame(window, padding=(18, 0, 18, 16))
+        footer.grid(row=4, column=0, sticky=tk.EW)
+
+        def refresh() -> None:
+            target = self.migration_target_var.get().strip()
+            if not target:
+                messagebox.showerror(
+                    "目标盘未选择", "请先明确选择目标盘或目录", parent=window
+                )
+                return
+            extension = self.migration_extension_var.get().strip() or None
+            try:
+                minimum_mb = float(self.migration_min_mb_var.get().strip() or "0")
+                if minimum_mb < 0:
+                    raise ValueError("最小 MB 不能为负数")
+            except ValueError as error:
+                messagebox.showerror("筛选无效", str(error), parent=window)
+                return
+            result = self.current_result
+            if result is None:
+                messagebox.showerror(
+                    "扫描结果不可用", "当前扫描结果已释放，请重新扫描", parent=window
+                )
+                return
+            self.migration_refresh_button.configure(state=tk.DISABLED)
+            self.migration_status_var.set("正在读取已记录文件状态和目标盘空间……")
+
+            def worker() -> None:
+                try:
+                    advice = build_migration_advice(
+                        tuple(result.items),
+                        target,
+                        active_data_directory=self.storage.database_path.parent,
+                        extension=extension,
+                        min_size=int(minimum_mb * 1024 * 1024),
+                        limit=200,
+                        inspection_limit=1_000,
+                    )
+                except Exception as error:
+                    self.messages.put(("migration_advice_error", str(error)))
+                else:
+                    self.messages.put(("migration_advice_done", advice))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        self.migration_refresh_button = ttk.Button(
+            footer, text="刷新建议", command=refresh, style="Accent.TButton"
+        )
+        self.migration_refresh_button.pack(side=tk.RIGHT)
+        ttk.Button(
+            footer, text="关闭", command=self._close_migration_advice
+        ).pack(side=tk.RIGHT, padx=(0, 8))
+        window.protocol("WM_DELETE_WINDOW", self._close_migration_advice)
+        window.bind("<Escape>", lambda _event: self._close_migration_advice())
+        window.bind("<Configure>", self._schedule_display_sync, add="+")
+        position_near_cursor(window)
+        window.lift()
+        window.focus_force()
+
+    def _render_migration_advice(self, advice: dict) -> None:
+        window = self.migration_window
+        if window is None or not window.winfo_exists():
+            return
+        for tree in (self.migration_candidate_tree, self.migration_excluded_tree):
+            for item_id in tree.get_children():
+                tree.delete(item_id)
+        for item in advice["candidates"]:
+            basis = (
+                "唯一分配大小"
+                if item["estimate_basis"] == "unique_allocated_size"
+                else "逻辑大小（保守）"
+            )
+            self.migration_candidate_tree.insert(
+                "",
+                tk.END,
+                text=item["path"],
+                values=(
+                    format_bytes(item["logical_size_bytes"]),
+                    format_bytes(item["estimated_size_bytes"]),
+                    basis,
+                ),
+            )
+        for item in advice["excluded"]:
+            reasons = "；".join(
+                MIGRATION_REASON_LABELS.get(code, code)
+                for code in item["reason_codes"]
+            )
+            self.migration_excluded_tree.insert(
+                "",
+                tk.END,
+                text=item["path"],
+                values=(format_bytes(item["logical_size_bytes"]), reasons),
+            )
+        target = advice["target"]
+        remaining = format_bytes(abs(target["estimated_remaining_bytes"]))
+        if target["space_sufficient"]:
+            space_text = f"保守剩余 {remaining}"
+        else:
+            space_text = f"空间不足，缺少 {remaining}"
+        self.migration_status_var.set(
+            f"目标盘可用 {format_bytes(target['free_bytes'])} · "
+            f"建议合计 {format_bytes(advice['estimated_total_bytes'])} · "
+            f"{space_text} · 候选 {len(advice['candidates'])} / "
+            f"排除 {advice['excluded_count']}"
+        )
+        self.migration_refresh_button.configure(state=tk.NORMAL)
+
+    def _close_migration_advice(self) -> None:
+        window = self.migration_window
+        self.migration_window = None
+        if window is None:
+            return
+        try:
+            if window.winfo_exists():
+                window.destroy()
+        except tk.TclError:
+            pass
+
+    def _open_current_snapshot_browser(self) -> None:
+        if self.current_result is None or self.current_result.snapshot_id is None:
+            messagebox.showinfo(
+                "查找/筛选", "当前结果尚未保存为可查询快照", parent=self.root
+            )
+            return
+        self._open_snapshot_browser(self.current_result.snapshot_id)
+
+    def _open_selected_snapshot_browser(self) -> None:
+        selected = self.history_tree.selection()
+        if len(selected) != 1:
+            return
+        snapshot = self.history_items_by_id.get(selected[0])
+        if snapshot is not None:
+            self._open_snapshot_browser(snapshot.id)
+
+    def _open_snapshot_browser(self, snapshot_id: int) -> None:
+        self._close_snapshot_browser()
+        database = ReadOnlyDatabase(self.storage.database_path)
+        try:
+            snapshot = database.snapshot_info(snapshot_id)
+        except Exception as error:
+            messagebox.showerror("快照不可用", str(error), parent=self.root)
+            return
+        if snapshot is None:
+            messagebox.showerror("快照不可用", "指定快照不存在", parent=self.root)
+            return
+
+        window = tk.Toplevel(self.root)
+        self.snapshot_browser_window = window
+        window.title(f"快照 #{snapshot_id} · 深层查看与查找")
+        self._configure_dialog_window(
+            window,
+            width=1050,
+            height=680,
+            minimum_width=860,
+            minimum_height=560,
+        )
+        window.configure(bg=COLORS["background"])
+        if self.app_icon_path.exists():
+            window.iconbitmap(default=str(self.app_icon_path))
+        if self._window_is_visible():
+            window.transient(self.root)
+
+        header = ttk.Frame(window, padding=(18, 14, 18, 8))
+        header.pack(fill=tk.X)
+        ttk.Label(
+            header,
+            text=f"快照 #{snapshot_id} · {snapshot['finished_at']}",
+            style="DialogTitle.TLabel",
+        ).pack(anchor=tk.W)
+        ttk.Label(
+            header,
+            text=(
+                f"根路径：{snapshot['root_path']} · "
+                f"深层状态：{snapshot['directory_summary_state']} · "
+                f"排除 {snapshot['excluded_rule_count']} 条规则 / "
+                f"{snapshot['excluded_item_count']} 个对象"
+            ),
+            style="Subtitle.TLabel",
+        ).pack(anchor=tk.W, pady=(3, 0))
+
+        controls = ttk.Frame(window, style="Panel.TFrame", padding=10)
+        controls.pack(fill=tk.X, padx=18)
+        path_var = tk.StringVar(value=snapshot["root_path"])
+        query_var = tk.StringVar()
+        mode_var = tk.StringVar(value="子串")
+        kind_var = tk.StringVar(value="全部")
+        extension_var = tk.StringVar()
+        min_mb_var = tk.StringVar()
+        max_mb_var = tk.StringVar()
+        modified_after_var = tk.StringVar()
+        modified_before_var = tk.StringVar()
+        ttk.Label(controls, text="当前目录", background=COLORS["panel"]).grid(
+            row=0, column=0, sticky=tk.W
+        )
+        ttk.Entry(controls, textvariable=path_var, state="readonly").grid(
+            row=0, column=1, columnspan=5, sticky=tk.EW, padx=(6, 8)
+        )
+        ttk.Label(controls, text="搜索", background=COLORS["panel"]).grid(
+            row=1, column=0, sticky=tk.W, pady=(8, 0)
+        )
+        query_entry = ttk.Entry(controls, textvariable=query_var, width=24)
+        query_entry.grid(
+            row=1, column=1, sticky=tk.EW, padx=(6, 8), pady=(8, 0)
+        )
+        ttk.Combobox(
+            controls,
+            textvariable=mode_var,
+            values=("路径前缀", "子串"),
+            state="readonly",
+            width=9,
+        ).grid(row=1, column=2, padx=(0, 8), pady=(8, 0))
+        ttk.Combobox(
+            controls,
+            textvariable=kind_var,
+            values=("全部", "文件", "目录"),
+            state="readonly",
+            width=7,
+        ).grid(row=1, column=3, padx=(0, 8), pady=(8, 0))
+        ttk.Label(controls, text="扩展名", background=COLORS["panel"]).grid(
+            row=1, column=4, sticky=tk.E, pady=(8, 0)
+        )
+        ttk.Entry(controls, textvariable=extension_var, width=9).grid(
+            row=1, column=5, sticky=tk.W, padx=(6, 0), pady=(8, 0)
+        )
+        ttk.Label(controls, text="大小 MB", background=COLORS["panel"]).grid(
+            row=2, column=0, sticky=tk.W, pady=(8, 0)
+        )
+        size_frame = ttk.Frame(controls, style="Panel.TFrame")
+        size_frame.grid(row=2, column=1, sticky=tk.W, padx=(6, 8), pady=(8, 0))
+        ttk.Entry(size_frame, textvariable=min_mb_var, width=8).pack(side=tk.LEFT)
+        ttk.Label(size_frame, text=" 至 ", background=COLORS["panel"]).pack(
+            side=tk.LEFT
+        )
+        ttk.Entry(size_frame, textvariable=max_mb_var, width=8).pack(side=tk.LEFT)
+        ttk.Label(controls, text="修改日期", background=COLORS["panel"]).grid(
+            row=2, column=2, sticky=tk.E, pady=(8, 0)
+        )
+        date_frame = ttk.Frame(controls, style="Panel.TFrame")
+        date_frame.grid(
+            row=2, column=3, columnspan=3, sticky=tk.W, padx=(6, 0), pady=(8, 0)
+        )
+        ttk.Entry(date_frame, textvariable=modified_after_var, width=12).pack(
+            side=tk.LEFT
+        )
+        ttk.Label(date_frame, text=" 至 ", background=COLORS["panel"]).pack(
+            side=tk.LEFT
+        )
+        ttk.Entry(date_frame, textvariable=modified_before_var, width=12).pack(
+            side=tk.LEFT
+        )
+        ttk.Label(
+            date_frame, text=" YYYY-MM-DD", background=COLORS["panel"]
+        ).pack(side=tk.LEFT)
+        controls.columnconfigure(1, weight=1)
+
+        button_row = ttk.Frame(window, padding=(18, 8, 18, 6))
+        button_row.pack(fill=tk.X)
+        status_var = tk.StringVar(value="正在读取快照目录……")
+        ttk.Label(button_row, textvariable=status_var, style="Subtitle.TLabel").pack(
+            anchor=tk.W, fill=tk.X
+        )
+        action_row = ttk.Frame(button_row)
+        action_row.pack(fill=tk.X, pady=(6, 0))
+        up_button = ttk.Button(action_row, text="上一级")
+        browse_button = ttk.Button(action_row, text="浏览当前层")
+        search_button = ttk.Button(action_row, text="搜索")
+        largest_button = ttk.Button(action_row, text="最大文件")
+        next_button = ttk.Button(action_row, text="下一页", state=tk.DISABLED)
+        for button in (
+            up_button,
+            browse_button,
+            search_button,
+            largest_button,
+            next_button,
+        ):
+            button.pack(side=tk.LEFT, padx=(0, 6))
+
+        tree = ttk.Treeview(
+            window,
+            columns=("kind", "size", "modified", "state"),
+            show="tree headings",
+        )
+        tree.heading("#0", text="完整路径 / 聚合项")
+        tree.heading("kind", text="类型")
+        tree.heading("size", text="逻辑大小")
+        tree.heading("modified", text="修改时间")
+        tree.heading("state", text="统计状态")
+        tree.column("#0", width=600, stretch=True)
+        tree.column("kind", width=80, anchor=tk.CENTER)
+        tree.column("size", width=110, anchor=tk.E)
+        tree.column("modified", width=145)
+        tree.column("state", width=110)
+        scrollbar = ttk.Scrollbar(window, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 18), pady=(0, 12))
+        tree.pack(fill=tk.BOTH, expand=True, padx=(18, 0), pady=(0, 12))
+        item_by_id: dict[str, dict] = {}
+        next_cursor: int | None = None
+        last_action: str | None = None
+
+        def render(data: dict) -> None:
+            item_by_id.clear()
+            for item_id in tree.get_children():
+                tree.delete(item_id)
+            for index, item in enumerate(data["items"]):
+                item_id = f"result-{index}"
+                item_by_id[item_id] = item
+                modified = item.get("modified_at")
+                modified_text = (
+                    datetime.fromtimestamp(modified).strftime("%Y-%m-%d %H:%M:%S")
+                    if isinstance(modified, (int, float)) and modified > 0
+                    else "--"
+                )
+                kind_text = {
+                    "file": "文件",
+                    "directory": "目录",
+                    "aggregate": "未记录明细",
+                }.get(item.get("kind"), str(item.get("kind", "")))
+                display_path = item.get("path") or item.get("name", "未记录文件明细")
+                tree.insert(
+                    "",
+                    tk.END,
+                    iid=item_id,
+                    text=display_path,
+                    values=(
+                        kind_text,
+                        format_bytes(int(item.get("size_bytes", 0))),
+                        modified_text,
+                        item.get("measurement_state", "--"),
+                    ),
+                )
+            status_var.set(
+                f"{data.get('coverage', '')} · 本页 {len(data['items'])} 项"
+            )
+
+        def parse_filters() -> dict:
+            def parse_mb(value: str) -> int | None:
+                stripped = value.strip()
+                if not stripped:
+                    return None
+                parsed = float(stripped)
+                if parsed < 0:
+                    raise ValueError("大小不能为负数")
+                return int(parsed * 1024 * 1024)
+
+            def parse_modified(value: str, *, end_of_day: bool) -> float | None:
+                stripped = value.strip()
+                if not stripped:
+                    return None
+                parsed = datetime.fromisoformat(stripped)
+                if len(stripped) == 10 and end_of_day:
+                    parsed = parsed.replace(hour=23, minute=59, second=59)
+                return parsed.timestamp()
+
+            return {
+                "extension": extension_var.get().strip() or None,
+                "min_size": parse_mb(min_mb_var.get()),
+                "max_size": parse_mb(max_mb_var.get()),
+                "modified_after": parse_modified(
+                    modified_after_var.get(), end_of_day=False
+                ),
+                "modified_before": parse_modified(
+                    modified_before_var.get(), end_of_day=True
+                ),
+            }
+
+        def browse(path: str | None = None) -> None:
+            nonlocal next_cursor, last_action
+            try:
+                data = database.snapshot_tree(
+                    snapshot_id, path or path_var.get(), limit=200
+                )
+            except Exception as error:
+                messagebox.showerror("目录不可用", str(error), parent=window)
+                return
+            path_var.set(data["path"])
+            next_cursor = None
+            last_action = None
+            next_button.configure(state=tk.DISABLED)
+            root_path = os.path.normcase(os.path.abspath(snapshot["root_path"]))
+            up_button.configure(
+                state=(
+                    tk.DISABLED
+                    if os.path.normcase(os.path.abspath(data["path"])) == root_path
+                    else tk.NORMAL
+                )
+            )
+            render(data)
+
+        def run_filtered(action: str, cursor: int = 0) -> None:
+            nonlocal next_cursor, last_action
+            try:
+                filters = parse_filters()
+                if action == "search":
+                    data = database.search_snapshot(
+                        snapshot_id,
+                        query_var.get(),
+                        mode=(
+                            "prefix" if mode_var.get() == "路径前缀" else "substring"
+                        ),
+                        kind={"全部": "any", "文件": "file", "目录": "directory"}[
+                            kind_var.get()
+                        ],
+                        limit=200,
+                        cursor=cursor,
+                        **filters,
+                    )
+                else:
+                    data = database.largest_snapshot_files(
+                        snapshot_id,
+                        limit=200,
+                        cursor=cursor,
+                        **filters,
+                    )
+            except Exception as error:
+                messagebox.showerror("查询无效", str(error), parent=window)
+                return
+            next_cursor = data["next_cursor"]
+            last_action = action
+            next_button.configure(
+                state=tk.NORMAL if next_cursor is not None else tk.DISABLED
+            )
+            render(data)
+
+        def go_up() -> None:
+            current = os.path.normcase(os.path.abspath(path_var.get()))
+            root_path = os.path.normcase(os.path.abspath(snapshot["root_path"]))
+            parent = os.path.dirname(current)
+            if self._path_is_within(parent, root_path):
+                browse(parent)
+
+        def open_selected(_event: tk.Event | None = None) -> None:
+            selected = tree.selection()
+            if not selected:
+                return
+            item = item_by_id.get(selected[0])
+            if item and item.get("kind") == "directory" and item.get("path"):
+                browse(item["path"])
+
+        def load_next() -> None:
+            if last_action is not None and next_cursor is not None:
+                run_filtered(last_action, next_cursor)
+
+        up_button.configure(command=go_up)
+        browse_button.configure(command=browse)
+        search_button.configure(command=lambda: run_filtered("search"))
+        largest_button.configure(command=lambda: run_filtered("largest"))
+        next_button.configure(command=load_next)
+        query_entry.bind("<Return>", lambda _event: run_filtered("search"))
+        tree.bind("<Double-Button-1>", open_selected)
+        window.protocol("WM_DELETE_WINDOW", self._close_snapshot_browser)
+        window.bind("<Escape>", lambda _event: self._close_snapshot_browser())
+        window.bind("<Configure>", self._schedule_display_sync, add="+")
+        position_near_cursor(window)
+        browse(snapshot["root_path"])
+        window.lift()
+        window.focus_force()
+
+    def _close_snapshot_browser(self) -> None:
+        window = self.snapshot_browser_window
+        self.snapshot_browser_window = None
+        if window is None:
+            return
         try:
             if window.winfo_exists():
                 window.destroy()
@@ -2109,7 +2898,6 @@ class DiskMonitorApp:
                     self.low_memory_started_at = sample.recorded_at
                     self.low_memory_start_sample = sample
                     self.low_memory_reference_snapshot_id = None
-                    self.low_memory_reference_finished_at = None
                     self.baseline_pending = False
                     self.status_var.set(
                         "低内存模式已启动：持续记录磁盘趋势，不建立目录基线"
@@ -2302,6 +3090,8 @@ class DiskMonitorApp:
         self.cancel_event = threading.Event()
         self.scan_button.configure(state=tk.DISABLED)
         self.save_snapshot_button.configure(state=tk.DISABLED)
+        self.migration_advice_button.configure(state=tk.DISABLED)
+        self.search_filter_button.configure(state=tk.DISABLED)
         self.up_button.configure(state=tk.DISABLED)
         self.cancel_button.configure(
             state=tk.DISABLED if role == "closing" else tk.NORMAL
@@ -2337,10 +3127,13 @@ class DiskMonitorApp:
                 progress_callback=lambda value: self.messages.put(
                     ("scan_progress", value)
                 ),
+                collect_file_space=self.collect_file_space,
+                exclude_rules=self.exclude_rules,
             )
             note = self.pending_scan_note if role == "manual_save" else None
             snapshot_source = "manual" if role == "low_memory_resume" else role
             self.storage.save_scan(result, note=note, source=snapshot_source)
+            self.storage.prune_directory_metrics()
             if role == "baseline":
                 if self.session_id is not None and result.snapshot_id is not None:
                     self.storage.set_session_start_snapshot(
@@ -2514,6 +3307,20 @@ class DiskMonitorApp:
                         )
                     elif role != "baseline":
                         self._start_pending_baseline()
+                elif kind == "migration_advice_done":
+                    self._render_migration_advice(message[1])
+                elif kind == "migration_advice_error":
+                    if (
+                        self.migration_window is not None
+                        and self.migration_window.winfo_exists()
+                    ):
+                        self.migration_refresh_button.configure(state=tk.NORMAL)
+                        self.migration_status_var.set("建议刷新失败")
+                        messagebox.showerror(
+                            "迁移建议不可用",
+                            message[1],
+                            parent=self.migration_window,
+                        )
                 elif kind == "close_done":
                     self.logger.info(
                         "scan_ui_finished role=closing outcome=success snapshot_id=%s",
@@ -2573,6 +3380,20 @@ class DiskMonitorApp:
         self.save_snapshot_button.configure(
             state=tk.DISABLED if controls_disabled else tk.NORMAL
         )
+        self.migration_advice_button.configure(
+            state=(
+                tk.NORMAL
+                if self.current_result is not None and not self.closing
+                else tk.DISABLED
+            )
+        )
+        self.search_filter_button.configure(
+            state=(
+                tk.NORMAL
+                if self.current_result is not None and not self.closing
+                else tk.DISABLED
+            )
+        )
         self.choose_directory_button.configure(
             state=tk.DISABLED if controls_disabled else tk.NORMAL
         )
@@ -2584,6 +3405,87 @@ class DiskMonitorApp:
             self._refresh_breadcrumbs()
         self._update_tray_state()
 
+    @staticmethod
+    def _result_space_text(result: ScanResult) -> str:
+        parts = [f"逻辑 {format_bytes(result.total_bytes)}"]
+        if result.measurement_state == "exact":
+            assert result.allocated_total_bytes is not None
+            assert result.unique_allocated_total_bytes is not None
+            parts.extend(
+                (
+                    f"分配 {format_bytes(result.allocated_total_bytes)}",
+                    "唯一分配 "
+                    f"{format_bytes(result.unique_allocated_total_bytes)}",
+                )
+            )
+        elif result.measurement_state == "partial":
+            parts.extend(
+                (
+                    "已测量分配 "
+                    f"{format_bytes(result.measured_allocated_bytes)}",
+                    "已确认唯一 "
+                    f"{format_bytes(result.measured_unique_allocated_bytes)}",
+                    "覆盖 "
+                    f"{result.identity_measured_file_count:,}/"
+                    f"{result.eligible_file_count:,} 文件",
+                )
+            )
+        elif result.measurement_state == "unavailable":
+            parts.append("分配/硬链接信息不可用")
+        elif result.measurement_state == "legacy":
+            parts.append("未记录分配/硬链接")
+        return " · ".join(parts)
+
+    @staticmethod
+    def _item_space_text(item: ScanItem) -> str:
+        parts = [f"逻辑 {format_bytes(item.size_bytes)}"]
+        if item.allocated_size_bytes is not None:
+            parts.append(f"分配 {format_bytes(item.allocated_size_bytes)}")
+        if item.is_unique_owner is False:
+            parts.append("同一文件的其他路径")
+        elif item.unique_allocated_size_bytes is not None:
+            parts.append(
+                "唯一分配 "
+                f"{format_bytes(item.unique_allocated_size_bytes)}"
+            )
+        if item.link_count is not None:
+            parts.append(f"链接 {item.link_count:,}")
+        if item.measurement_state == "partial":
+            parts.append("原生信息不完整")
+        elif item.measurement_state == "unavailable":
+            parts.append("原生信息不可用")
+        return " · ".join(parts)
+
+    def _unique_growth_text(self, result: ScanResult) -> str:
+        if result.measurement_state == "legacy" or result.snapshot_id is None:
+            return ""
+        previous_id = self.storage.previous_snapshot_id(result)
+        if previous_id is None:
+            return ""
+        try:
+            comparison = self.storage.compare_snapshot_accounting(
+                result.snapshot_id, previous_id, limit=20
+            )
+        except (OSError, RuntimeError, sqlite3.Error, ValueError):
+            self.logger.exception("accounting_comparison_failed")
+            return "唯一分配变化暂不可用"
+        if not comparison["available"]:
+            if comparison["old_measurement_state"] == "legacy":
+                return "唯一分配变化不可比较（旧快照未记录该口径）"
+            return "唯一分配变化不可比较（覆盖不足）"
+        change = int(comparison["unique_allocated_total_change_bytes"])
+        change_text = format_bytes(change)
+        if change > 0:
+            change_text = "+" + change_text
+        text = f"唯一分配变化 {change_text}"
+        unattributed = int(comparison["unattributed_unique_change_bytes"])
+        if unattributed:
+            unattributed_text = format_bytes(unattributed)
+            if unattributed > 0:
+                unattributed_text = "+" + unattributed_text
+            text += f"（记录明细未归因 {unattributed_text}）"
+        return text
+
     def _show_scan_result(
         self,
         result: ScanResult,
@@ -2593,21 +3495,39 @@ class DiskMonitorApp:
         update_growth: bool = True,
     ) -> None:
         self.current_result = result
+        self.migration_advice_button.configure(
+            state=tk.DISABLED if self.closing else tk.NORMAL
+        )
+        self.search_filter_button.configure(
+            state=tk.DISABLED if self.closing else tk.NORMAL
+        )
         self.path_var.set(result.root_path)
         elapsed = (result.finished_at - result.started_at).total_seconds()
+        unique_growth_text = self._unique_growth_text(result)
+        accounting_suffix = (
+            f"，{unique_growth_text}" if unique_growth_text else ""
+        )
         self.status_var.set(
             f"扫描完成：{result.file_count:,} 个文件，"
-            f"{format_bytes(result.total_bytes)}，{elapsed:.1f} 秒，"
-            f"跳过/错误 {result.error_count}"
+            f"{self._result_space_text(result)}，{elapsed:.1f} 秒，"
+            f"排除 {result.excluded_item_count}，错误 {result.error_count}"
+            f"{accounting_suffix}"
         )
         data_time = result.finished_at.strftime("%Y-%m-%d %H:%M:%S")
         self.last_scan_summary = (
             f"{result.file_count:,} 文件 / {result.directory_count:,} 目录 / "
-            f"错误 {result.error_count} / {elapsed:.1f} 秒 / {data_time}"
+            f"排除 {result.excluded_item_count} / 错误 {result.error_count} / "
+            f"{elapsed:.1f} 秒 / {data_time}"
         )
         self.detail_var.set(
-            f"{result.root_path} · {format_bytes(result.total_bytes)} · "
+            f"{result.root_path} · {self._result_space_text(result)} · "
             f"{result.file_count:,} 个文件"
+            + (
+                f" · 已排除 {result.excluded_rule_count} 条规则"
+                if result.excluded_rule_count
+                else ""
+            )
+            + (f" · {unique_growth_text}" if unique_growth_text else "")
         )
         self._draw_treemap(animate=True)
         self.logger.info(
@@ -3039,9 +3959,42 @@ class DiskMonitorApp:
             self.history_items_by_id.clear()
             for item_id in self.history_tree.get_children():
                 self.history_tree.delete(item_id)
-        snapshots = self.storage.list_snapshots(
-            limit=200, cursor=self.history_cursor
-        )
+        try:
+            source_label = self.history_source_filter_var.get()
+            source = next(
+                (
+                    key
+                    for key, label in SNAPSHOT_SOURCE_LABELS.items()
+                    if label == source_label
+                ),
+                None,
+            )
+
+            def parse_date(value: str, *, end_of_day: bool) -> datetime | None:
+                stripped = value.strip()
+                if not stripped:
+                    return None
+                parsed = datetime.fromisoformat(stripped)
+                if len(stripped) == 10 and end_of_day:
+                    parsed = parsed.replace(hour=23, minute=59, second=59)
+                return parsed
+
+            snapshots = self.storage.list_snapshots(
+                limit=200,
+                cursor=self.history_cursor,
+                root_path=self.history_path_filter_var.get().strip() or None,
+                source=source,
+                finished_after=parse_date(
+                    self.history_after_filter_var.get(), end_of_day=False
+                ),
+                finished_before=parse_date(
+                    self.history_before_filter_var.get(), end_of_day=True
+                ),
+            )
+        except ValueError as error:
+            self.history_status_var.set(f"筛选无效：{error}")
+            messagebox.showerror("快照筛选无效", str(error), parent=self.root)
+            return
         for snapshot in snapshots:
             item_id = f"snapshot-{snapshot.id}"
             self.history_items_by_id[item_id] = snapshot
@@ -3097,6 +4050,9 @@ class DiskMonitorApp:
         self, _event: tk.Event | None = None
     ) -> None:
         selected = self.history_tree.selection()
+        self.view_history_button.configure(
+            state=tk.NORMAL if len(selected) == 1 else tk.DISABLED
+        )
         if len(selected) != 2:
             self.compare_history_button.configure(state=tk.DISABLED)
             self.history_status_var.set(
@@ -3129,6 +4085,24 @@ class DiskMonitorApp:
             old_info.root_path
         ) != self._normalize_path(new_info.root_path):
             self._update_history_selection()
+            return
+        try:
+            config_comparison = self.storage.snapshot_config_comparison(
+                new_info.id, old_info.id
+            )
+        except ValueError as error:
+            messagebox.showerror("快照不可比较", str(error), parent=self.root)
+            return
+        if config_comparison["status"] == "mismatch":
+            differences = "、".join(config_comparison["differences"])
+            self.history_status_var.set(
+                f"扫描配置不同，已阻止增长归因：{differences}"
+            )
+            messagebox.showwarning(
+                "扫描配置不同",
+                f"默认不生成增长归因。不同项：{differences}",
+                parent=self.root,
+            )
             return
         self._set_change_context(
             (
@@ -3254,11 +4228,45 @@ class DiskMonitorApp:
             has_baseline = bool(self.change_context[2])
         else:
             new_snapshot_id, old_snapshot_id = self.change_context[1:3]
-            changes = self.storage.compare_snapshot_changes(
-                new_snapshot_id,
-                old_snapshot_id,
-                direction=direction,
-            )
+            root_path = self.change_context[-1]
+            try:
+                deep_comparison = ReadOnlyDatabase(
+                    self.storage.database_path
+                ).compare_directory_history(
+                    new_snapshot_id,
+                    old_snapshot_id,
+                    root_path,
+                    direction=direction,
+                    limit=100,
+                )
+            except ControlError as error:
+                if error.code not in {
+                    "scan_config_unknown",
+                    "directory_history_unavailable",
+                }:
+                    self.status_var.set(f"快照对比失败：{error}")
+                    self._fill_growth_tree([], False)
+                    return
+                changes = self.storage.compare_snapshot_changes(
+                    new_snapshot_id,
+                    old_snapshot_id,
+                    direction=direction,
+                )
+            else:
+                changes = [
+                    GrowthItem(
+                        path=(
+                            item["path"]
+                            or os.path.join(root_path, "未记录文件明细")
+                        ),
+                        parent_path=root_path,
+                        name=item["name"],
+                        kind=item["kind"],
+                        old_size_bytes=item["old_size_bytes"],
+                        new_size_bytes=item["new_size_bytes"],
+                    )
+                    for item in deep_comparison["items"]
+                ]
             has_baseline = True
         self._fill_growth_tree(changes, has_baseline)
 
@@ -3499,7 +4507,7 @@ class DiskMonitorApp:
         if item:
             kind = "目录" if item.kind == "directory" else "文件"
             self.detail_var.set(
-                f"{kind}：{item.path} · {format_bytes(item.size_bytes)} · "
+                f"{kind}：{item.path} · {self._item_space_text(item)} · "
                 f"{item.file_count:,} 个文件"
             )
 
@@ -3526,7 +4534,7 @@ class DiskMonitorApp:
             "aggregate": "小文件汇总",
         }.get(item.kind, item.kind)
         self.detail_var.set(
-            f"{kind}：{item.path} · {format_bytes(item.size_bytes)} · "
+            f"{kind}：{item.path} · {self._item_space_text(item)} · "
             f"{item.file_count:,} 个文件"
         )
 
@@ -3543,7 +4551,7 @@ class DiskMonitorApp:
         if self.current_result is not None:
             self.detail_var.set(
                 f"{self.current_result.root_path} · "
-                f"{format_bytes(self.current_result.total_bytes)} · "
+                f"{self._result_space_text(self.current_result)} · "
                 f"{self.current_result.file_count:,} 个文件"
             )
 
@@ -3784,6 +4792,8 @@ class DiskMonitorApp:
                     pass
                 setattr(self, attribute, None)
         self._close_settings_window()
+        self._close_migration_advice()
+        self._close_snapshot_browser()
         if self.tray_icon is not None:
             try:
                 self.tray_icon.stop()
@@ -3860,6 +4870,9 @@ class DiskMonitorApp:
 
     def _begin_close_sequence(self) -> None:
         self.closing = True
+        self._close_settings_window()
+        self._close_migration_advice()
+        self._close_snapshot_browser()
         self.mode_toggle_button.configure(state=tk.DISABLED)
         self._cancel_treemap_animation()
         if self.treemap_resize_after_id is not None:
@@ -3871,6 +4884,8 @@ class DiskMonitorApp:
         self.baseline_pending = False
         self.scan_button.configure(state=tk.DISABLED)
         self.save_snapshot_button.configure(state=tk.DISABLED)
+        self.migration_advice_button.configure(state=tk.DISABLED)
+        self.search_filter_button.configure(state=tk.DISABLED)
         self.up_button.configure(state=tk.DISABLED)
         self.cancel_button.configure(state=tk.DISABLED)
         self.path_entry.configure(state=tk.DISABLED)

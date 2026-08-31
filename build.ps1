@@ -16,7 +16,7 @@ $buildPython = if (Test-Path -LiteralPath ".venv\Scripts\python.exe") {
     --manifest "assets\app.manifest" `
     --icon "assets\app.ico" `
     --add-data "assets\app.ico;assets" `
-    --name "disk-space-growth-monitor-v0.7.5" `
+    --name "disk-space-growth-monitor-v0.8.1" `
     run.py
 
 if ($LASTEXITCODE -ne 0) {
@@ -31,7 +31,7 @@ if ($LASTEXITCODE -ne 0) {
     --noupx `
     --version-file "version_info_cli.txt" `
     --icon "assets\app.ico" `
-    --name "diskmonitor-cli-v0.7.5" `
+    --name "diskmonitor-cli-v0.8.1" `
     run_cli.py
 
 if ($LASTEXITCODE -ne 0) {
@@ -39,5 +39,5 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "打包完成："
-Write-Host "  dist\disk-space-growth-monitor-v0.7.5.exe"
-Write-Host "  dist\diskmonitor-cli-v0.7.5.exe"
+Write-Host "  dist\disk-space-growth-monitor-v0.8.1.exe"
+Write-Host "  dist\diskmonitor-cli-v0.8.1.exe"

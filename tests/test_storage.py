@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 import sqlite3
 from contextlib import closing
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
 from disk_monitor.models import DiskSample, ScanItem, ScanResult
-from disk_monitor.storage import Storage
+from disk_monitor.readonly import ReadOnlyDatabase
+from disk_monitor.scanner import scan_path
+from disk_monitor.storage import CURRENT_SCHEMA_VERSION, Storage
 
 
 def make_result(root: str, size: int) -> ScanResult:
@@ -30,6 +34,124 @@ def make_result(root: str, size: int) -> ScanResult:
     )
 
 
+def create_v1_database(database_path: Path) -> None:
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE disk_samples (
+                id INTEGER PRIMARY KEY,
+                recorded_at TEXT NOT NULL,
+                drive TEXT NOT NULL,
+                total_bytes INTEGER NOT NULL,
+                used_bytes INTEGER NOT NULL,
+                free_bytes INTEGER NOT NULL
+            );
+            CREATE TABLE snapshots (
+                id INTEGER PRIMARY KEY,
+                root_path TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT NOT NULL,
+                total_bytes INTEGER NOT NULL,
+                file_count INTEGER NOT NULL,
+                directory_count INTEGER NOT NULL,
+                error_count INTEGER NOT NULL,
+                note TEXT,
+                source TEXT
+            );
+            CREATE TABLE snapshot_items (
+                snapshot_id INTEGER NOT NULL REFERENCES snapshots(id)
+                    ON DELETE CASCADE,
+                path TEXT NOT NULL,
+                parent_path TEXT NOT NULL,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                file_count INTEGER NOT NULL,
+                depth INTEGER NOT NULL,
+                modified_at REAL NOT NULL,
+                PRIMARY KEY(snapshot_id, path)
+            );
+            CREATE TABLE monitor_sessions (
+                id INTEGER PRIMARY KEY,
+                drive TEXT NOT NULL,
+                root_path TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                start_used_bytes INTEGER NOT NULL,
+                end_used_bytes INTEGER,
+                start_snapshot_id INTEGER,
+                end_snapshot_id INTEGER,
+                end_reason TEXT,
+                status TEXT NOT NULL DEFAULT 'active'
+            );
+            CREATE TABLE session_growth_items (
+                session_id INTEGER NOT NULL REFERENCES monitor_sessions(id)
+                    ON DELETE CASCADE,
+                path TEXT NOT NULL,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                old_size_bytes INTEGER NOT NULL,
+                new_size_bytes INTEGER NOT NULL,
+                change_bytes INTEGER NOT NULL,
+                PRIMARY KEY(session_id, path)
+            );
+            CREATE TABLE app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            INSERT INTO snapshots(
+                id, root_path, started_at, finished_at, total_bytes,
+                file_count, directory_count, error_count, note, source
+            ) VALUES (
+                1, 'C:\\fixture', '2026-08-01T00:00:00',
+                '2026-08-01T00:00:01', 10, 1, 1, 0, NULL, 'manual'
+            );
+            INSERT INTO snapshot_items(
+                snapshot_id, path, parent_path, name, kind, size_bytes,
+                file_count, depth, modified_at
+            ) VALUES (
+                1, 'C:\\fixture', 'C:\\', 'fixture', 'directory',
+                10, 1, 0, 0
+            );
+            PRAGMA user_version = 1;
+            """
+        )
+
+
+def create_v2_database(database_path: Path) -> None:
+    create_v1_database(database_path)
+    snapshot_columns = {
+        "allocated_total_bytes": "INTEGER",
+        "unique_allocated_total_bytes": "INTEGER",
+        "measured_allocated_bytes": "INTEGER NOT NULL DEFAULT 0",
+        "measured_unique_allocated_bytes": "INTEGER NOT NULL DEFAULT 0",
+        "eligible_file_count": "INTEGER NOT NULL DEFAULT 0",
+        "allocation_measured_file_count": "INTEGER NOT NULL DEFAULT 0",
+        "identity_measured_file_count": "INTEGER NOT NULL DEFAULT 0",
+        "metadata_error_count": "INTEGER NOT NULL DEFAULT 0",
+        "measurement_state": "TEXT NOT NULL DEFAULT 'legacy'",
+    }
+    item_columns = {
+        "allocated_size_bytes": "INTEGER",
+        "unique_allocated_size_bytes": "INTEGER",
+        "volume_serial_hex": "TEXT",
+        "file_id": "BLOB",
+        "link_count": "INTEGER",
+        "is_unique_owner": "INTEGER",
+        "measurement_state": "TEXT NOT NULL DEFAULT 'legacy'",
+    }
+    with closing(sqlite3.connect(database_path)) as connection:
+        for name, definition in snapshot_columns.items():
+            connection.execute(
+                f"ALTER TABLE snapshots ADD COLUMN {name} {definition}"
+            )
+        for name, definition in item_columns.items():
+            connection.execute(
+                f"ALTER TABLE snapshot_items ADD COLUMN {name} {definition}"
+            )
+        connection.execute("PRAGMA user_version = 2")
+
+
 class StorageTests(unittest.TestCase):
     def test_new_database_records_schema_version(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -39,7 +161,7 @@ class StorageTests(unittest.TestCase):
 
             with closing(sqlite3.connect(database_path)) as connection:
                 version = connection.execute("PRAGMA user_version").fetchone()[0]
-            self.assertEqual(version, 1)
+            self.assertEqual(version, CURRENT_SCHEMA_VERSION)
 
     def test_database_newer_than_supported_schema_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -184,7 +306,468 @@ class StorageTests(unittest.TestCase):
                 version = connection.execute("PRAGMA user_version").fetchone()[0]
             self.assertIn("note", columns)
             self.assertIn("source", columns)
+            self.assertEqual(version, CURRENT_SCHEMA_VERSION)
+
+    def test_v1_migration_creates_and_reuses_one_valid_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "monitor.db"
+            create_v1_database(database_path)
+
+            storage = Storage(database_path)
+
+            self.assertIsNotNone(storage.migration_backup_path)
+            assert storage.migration_backup_path is not None
+            self.assertTrue(storage.migration_backup_path.is_file())
+            backup_files = list(
+                (Path(temp_dir) / "backups").glob(
+                    "monitor-v1-before-v2-*.db"
+                )
+            )
+            self.assertEqual(backup_files, [storage.migration_backup_path])
+            with closing(
+                sqlite3.connect(storage.migration_backup_path)
+            ) as backup:
+                self.assertEqual(
+                    backup.execute("PRAGMA integrity_check").fetchone()[0],
+                    "ok",
+                )
+                self.assertEqual(
+                    backup.execute("PRAGMA user_version").fetchone()[0], 1
+                )
+                self.assertEqual(
+                    backup.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0],
+                    1,
+                )
+            loaded = storage.load_snapshot(1)
+            self.assertIsNotNone(loaded)
+            assert loaded is not None
+            self.assertEqual(loaded.measurement_state, "legacy")
+            self.assertIsNone(loaded.allocated_total_bytes)
+            readonly = ReadOnlyDatabase(database_path)
+            self.assertEqual(len(readonly.list_snapshots(limit=5)), 1)
+            self.assertIsNotNone(readonly.snapshot_info(1))
+            self.assertEqual(
+                readonly.get_setting("schema_v2_backup_path"),
+                str(storage.migration_backup_path),
+            )
+
+            reopened = Storage(database_path)
+
+            self.assertIsNone(reopened.migration_backup_path)
+            self.assertEqual(
+                len(
+                    list(
+                        (Path(temp_dir) / "backups").glob(
+                            "monitor-v1-before-v2-*.db"
+                        )
+                    )
+                ),
+                1,
+            )
+
+    def test_v2_migration_creates_one_backup_and_v3_tables(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "monitor.db"
+            create_v2_database(database_path)
+
+            storage = Storage(database_path)
+
+            self.assertIsNotNone(storage.migration_backup_path)
+            assert storage.migration_backup_path is not None
+            self.assertEqual(
+                list((Path(temp_dir) / "backups").glob("monitor-v2-before-v3-*.db")),
+                [storage.migration_backup_path],
+            )
+            with closing(sqlite3.connect(database_path)) as connection:
+                self.assertEqual(
+                    connection.execute("PRAGMA user_version").fetchone()[0], 3
+                )
+                tables = {
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    )
+                }
+                legacy_state = connection.execute(
+                    "SELECT directory_summary_state FROM snapshots WHERE id = 1"
+                ).fetchone()[0]
+            self.assertIn("directory_paths", tables)
+            self.assertIn("snapshot_directory_metrics", tables)
+            self.assertEqual(legacy_state, "legacy")
+            self.assertEqual(
+                ReadOnlyDatabase(database_path).get_setting(
+                    "schema_v3_backup_path"
+                ),
+                str(storage.migration_backup_path),
+            )
+
+            reopened = Storage(database_path)
+
+            self.assertIsNone(reopened.migration_backup_path)
+            self.assertEqual(
+                len(
+                    list(
+                        (Path(temp_dir) / "backups").glob(
+                            "monitor-v2-before-v3-*.db"
+                        )
+                    )
+                ),
+                1,
+            )
+
+    def test_failed_v2_migration_rolls_back_and_reuses_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "monitor.db"
+            create_v2_database(database_path)
+
+            with patch.object(
+                Storage,
+                "_apply_schema_v3",
+                side_effect=RuntimeError("injected v3 migration failure"),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "injected v3 migration failure"
+                ):
+                    Storage(database_path)
+
+            with closing(sqlite3.connect(database_path)) as connection:
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+                tables = {
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    )
+                }
+                columns = {
+                    row[1]
+                    for row in connection.execute("PRAGMA table_info(snapshots)")
+                }
+            self.assertEqual(version, 2)
+            self.assertNotIn("directory_paths", tables)
+            self.assertNotIn("snapshot_directory_metrics", tables)
+            self.assertNotIn("scan_config_version", columns)
+            self.assertEqual(
+                len(
+                    list(
+                        (Path(temp_dir) / "backups").glob(
+                            "monitor-v2-before-v3-*.db"
+                        )
+                    )
+                ),
+                1,
+            )
+
+            Storage(database_path)
+
+            self.assertEqual(
+                len(
+                    list(
+                        (Path(temp_dir) / "backups").glob(
+                            "monitor-v2-before-v3-*.db"
+                        )
+                    )
+                ),
+                1,
+            )
+
+    def test_failed_v1_migration_rolls_back_and_reuses_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "monitor.db"
+            create_v1_database(database_path)
+
+            with patch.object(
+                Storage,
+                "_apply_schema_v2",
+                side_effect=RuntimeError("injected migration failure"),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "injected migration failure"
+                ):
+                    Storage(database_path)
+
+            with closing(sqlite3.connect(database_path)) as connection:
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+                columns = {
+                    row[1]
+                    for row in connection.execute("PRAGMA table_info(snapshots)")
+                }
             self.assertEqual(version, 1)
+            self.assertNotIn("allocated_total_bytes", columns)
+            self.assertEqual(
+                len(
+                    list(
+                        (Path(temp_dir) / "backups").glob(
+                            "monitor-v1-before-v2-*.db"
+                        )
+                    )
+                ),
+                1,
+            )
+
+            Storage(database_path)
+
+            self.assertEqual(
+                len(
+                    list(
+                        (Path(temp_dir) / "backups").glob(
+                            "monitor-v1-before-v2-*.db"
+                        )
+                    )
+                ),
+                1,
+            )
+
+    def test_file_space_fields_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir) / "test.db")
+            result = make_result(str(Path(temp_dir) / "root"), 25)
+            result.allocated_total_bytes = 4096
+            result.unique_allocated_total_bytes = 4096
+            result.measured_allocated_bytes = 4096
+            result.measured_unique_allocated_bytes = 4096
+            result.eligible_file_count = 1
+            result.allocation_measured_file_count = 1
+            result.identity_measured_file_count = 1
+            result.measurement_state = "exact"
+            result.items = [
+                replace(
+                    item,
+                    allocated_size_bytes=4096,
+                    unique_allocated_size_bytes=4096,
+                    volume_serial_hex="000000001234abcd",
+                    file_id=bytes(range(16)),
+                    link_count=2,
+                    is_unique_owner=True,
+                    measurement_state="exact",
+                )
+                if item.kind == "file"
+                else item
+                for item in result.items
+            ]
+
+            snapshot_id = storage.save_scan(result)
+            loaded = storage.load_snapshot(snapshot_id)
+
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertEqual(loaded.allocated_total_bytes, 4096)
+        self.assertEqual(loaded.unique_allocated_total_bytes, 4096)
+        self.assertEqual(loaded.measurement_state, "exact")
+        loaded_file = next(
+            item for item in loaded.items if item.kind == "file"
+        )
+        self.assertEqual(loaded_file.file_id, bytes(range(16)))
+        self.assertEqual(loaded_file.link_count, 2)
+        self.assertTrue(loaded_file.is_unique_owner)
+
+    def test_full_directory_metrics_reuse_paths_and_round_trip_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            root = base / "root"
+            deep = root / "first" / "deep"
+            second = root / "second"
+            deep.mkdir(parents=True)
+            second.mkdir()
+            (deep / "data.bin").write_bytes(b"x" * 128)
+            (second / "other.bin").write_bytes(b"y" * 64)
+            storage = Storage(base / "monitor.db")
+            result = scan_path(str(root), record_depth=1)
+            result.scan_config_version = 1
+            result.scan_config_json = '{"collect_file_space":false}'
+
+            baseline_id = storage.save_scan(result, source="baseline")
+            closing_id = storage.save_scan(result, source="closing")
+            manual_id = storage.save_scan(result, source="manual")
+            loaded = storage.load_snapshot(baseline_id)
+
+            with closing(sqlite3.connect(base / "monitor.db")) as connection:
+                path_count = connection.execute(
+                    "SELECT COUNT(*) FROM directory_paths"
+                ).fetchone()[0]
+                metric_counts = {
+                    row[0]: row[1]
+                    for row in connection.execute(
+                        """
+                        SELECT snapshot_id, COUNT(*)
+                        FROM snapshot_directory_metrics
+                        GROUP BY snapshot_id
+                        """
+                    )
+                }
+                child_parent = connection.execute(
+                    """
+                    SELECT parent.path
+                    FROM directory_paths AS child
+                    JOIN directory_paths AS parent
+                        ON parent.id = child.parent_id
+                    WHERE child.path = ? COLLATE NOCASE
+                    """,
+                    (os.path.normcase(os.path.abspath(deep)),),
+                ).fetchone()[0]
+                summary_states = {
+                    row[0]: row[1]
+                    for row in connection.execute(
+                        "SELECT id, directory_summary_state FROM snapshots"
+                    )
+                }
+
+        self.assertEqual(path_count, result.directory_count)
+        self.assertEqual(metric_counts[baseline_id], result.directory_count)
+        self.assertEqual(metric_counts[closing_id], result.directory_count)
+        self.assertNotIn(manual_id, metric_counts)
+        self.assertEqual(
+            child_parent,
+            os.path.normcase(os.path.abspath(deep.parent)),
+        )
+        self.assertEqual(summary_states[baseline_id], "complete")
+        self.assertEqual(summary_states[closing_id], "complete")
+        self.assertEqual(summary_states[manual_id], "not_saved")
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertEqual(loaded.scan_config_version, 1)
+        self.assertEqual(
+            loaded.scan_config_json, '{"collect_file_space":false}'
+        )
+
+    def test_automatic_baseline_only_uses_matching_scan_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            root = base / "root"
+            root.mkdir()
+            (root / "data.bin").write_bytes(b"x")
+            storage = Storage(base / "monitor.db")
+            matching = scan_path(str(root), top_file_limit=0)
+            old_id = storage.save_scan(matching, source="manual")
+            matching_id = storage.save_scan(matching, source="manual")
+            different = scan_path(str(root), top_file_limit=1)
+            different_id = storage.save_scan(different, source="manual")
+
+            matching.snapshot_id = matching_id
+            self.assertEqual(storage.previous_snapshot_id(matching), old_id)
+            self.assertIsNone(storage.previous_snapshot_id(different))
+            with self.assertRaisesRegex(ValueError, "扫描配置不同"):
+                storage.compare_snapshot_changes(
+                    different_id,
+                    matching_id,
+                    direction="increase",
+                )
+
+    def test_selected_source_without_skeleton_is_marked_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "monitor.db"
+            storage = Storage(database_path)
+
+            snapshot_id = storage.save_scan(
+                make_result(str(Path(temp_dir) / "root"), 10),
+                source="baseline",
+            )
+
+            with closing(sqlite3.connect(database_path)) as connection:
+                state = connection.execute(
+                    "SELECT directory_summary_state FROM snapshots WHERE id = ?",
+                    (snapshot_id,),
+                ).fetchone()[0]
+                metric_count = connection.execute(
+                    """
+                    SELECT COUNT(*) FROM snapshot_directory_metrics
+                    WHERE snapshot_id = ?
+                    """,
+                    (snapshot_id,),
+                ).fetchone()[0]
+        self.assertEqual(state, "unavailable")
+        self.assertEqual(metric_count, 0)
+
+    def test_directory_metric_retention_preserves_active_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            root = base / "root"
+            root.mkdir()
+            (root / "data.bin").write_bytes(b"x")
+            storage = Storage(base / "monitor.db")
+            now = datetime.now().replace(microsecond=0)
+            result = scan_path(str(root))
+            directory_count = result.directory_count
+
+            def save_old(source: str, days: int) -> int:
+                result.started_at = now - timedelta(days=days)
+                result.finished_at = now - timedelta(days=days)
+                return storage.save_scan(result, source=source)
+
+            expired_baseline = save_old("baseline", 8)
+            expired_closing = save_old("closing", 31)
+            expired_manual = save_old("manual_save", 91)
+            active_baseline = save_old("baseline", 8)
+            sample = DiskSample(now, "C:\\", 1000, 400, 600)
+            session_id = storage.start_session(sample, str(root))
+            storage.set_session_start_snapshot(session_id, active_baseline)
+
+            deleted = storage.prune_directory_metrics(now=now)
+
+            with closing(sqlite3.connect(base / "monitor.db")) as connection:
+                remaining = {
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT DISTINCT snapshot_id FROM snapshot_directory_metrics"
+                    )
+                }
+                states = {
+                    row[0]: row[1]
+                    for row in connection.execute(
+                        "SELECT id, directory_summary_state FROM snapshots"
+                    )
+                }
+
+        self.assertEqual(deleted, directory_count * 3)
+        self.assertNotIn(expired_baseline, remaining)
+        self.assertNotIn(expired_closing, remaining)
+        self.assertNotIn(expired_manual, remaining)
+        self.assertIn(active_baseline, remaining)
+        self.assertEqual(states[expired_baseline], "expired")
+        self.assertEqual(states[active_baseline], "complete")
+
+    @unittest.skipUnless(os.name == "nt", "仅 Windows 提供硬链接统计")
+    def test_accounting_comparison_does_not_treat_alias_as_growth(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            root = base / "root"
+            first_directory = root / "a"
+            later_directory = root / "z"
+            first_directory.mkdir(parents=True)
+            later_directory.mkdir()
+            original = later_directory / "original.bin"
+            alias = first_directory / "alias.bin"
+            original.write_bytes(b"x" * 8193)
+            storage = Storage(base / "monitor.db")
+            old_id = storage.save_scan(
+                scan_path(
+                    str(root),
+                    record_depth=2,
+                    collect_file_space=True,
+                )
+            )
+            os.link(original, alias)
+            new_id = storage.save_scan(
+                scan_path(
+                    str(root),
+                    record_depth=2,
+                    collect_file_space=True,
+                )
+            )
+
+            comparison = storage.compare_snapshot_accounting(new_id, old_id)
+            readonly_comparison = ReadOnlyDatabase(
+                base / "monitor.db"
+            ).compare_snapshot_accounting(new_id, old_id)
+
+        self.assertTrue(comparison["available"])
+        self.assertEqual(comparison["unique_allocated_total_change_bytes"], 0)
+        self.assertEqual(comparison["verified_item_change_bytes"], 0)
+        self.assertEqual(comparison["items"][0]["change_bytes"], 0)
+        self.assertEqual(
+            comparison["items"][0]["change_kind"],
+            "accounting_path_changed",
+        )
+        self.assertEqual(readonly_comparison, comparison)
 
     def test_snapshot_history_uses_reference_source_priority(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

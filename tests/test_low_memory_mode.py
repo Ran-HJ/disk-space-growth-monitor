@@ -157,7 +157,7 @@ class LowMemoryModeTests(unittest.TestCase):
                 other_id = storage.save_scan(scan_path(str(other_root)), source="manual")
                 app.automatic_current_snapshot_id = other_id
                 self.assertEqual(
-                    app._select_low_memory_reference()[0], session_start_id
+                    app._select_low_memory_reference(), session_start_id
                 )
             finally:
                 app.session_finished = True
@@ -182,7 +182,16 @@ class LowMemoryModeTests(unittest.TestCase):
                 app.scan_thread = SimpleNamespace(is_alive=lambda: False)
                 app.active_scan_role = "manual"
                 with patch("disk_monitor.ui.messagebox.showinfo") as showinfo:
-                    self.assertFalse(app._request_run_mode(RUN_MODE_LOW_MEMORY))
+                    dialog_parent = object()
+                    self.assertFalse(
+                        app._request_run_mode(
+                            RUN_MODE_LOW_MEMORY,
+                            parent=dialog_parent,
+                        )
+                    )
+                    self.assertIs(
+                        showinfo.call_args.kwargs["parent"], dialog_parent
+                    )
                 showinfo.assert_called_once()
                 self.assertEqual(app.run_mode, RUN_MODE_FULL)
                 app.scan_thread = original_thread

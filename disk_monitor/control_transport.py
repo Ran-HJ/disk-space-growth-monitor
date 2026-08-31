@@ -193,8 +193,13 @@ class ControlServer:
         if os.name != "nt":
             raise RuntimeError("Agent 控制服务目前仅支持 Windows")
         self.control_directory.mkdir(parents=True, exist_ok=True)
-        for stale_auth in self.control_directory.glob("control-*.auth"):
-            stale_auth.unlink(missing_ok=True)
+        for pattern in (
+            "control-*.auth",
+            ".control-*.auth.tmp",
+            f".{ENDPOINT_FILENAME}.tmp",
+        ):
+            for stale_file in self.control_directory.glob(pattern):
+                stale_file.unlink(missing_ok=True)
         self._listener = Listener(
             self.pipe_address,
             family="AF_PIPE",
@@ -264,6 +269,7 @@ class ControlServer:
                 if not self._stop_event.is_set():
                     self.logger.exception("control_accept_failed")
                 break
+            request_id = ""
             with connection:
                 try:
                     if not connection.poll(5.0):
@@ -271,6 +277,7 @@ class ControlServer:
                     request = decode_request(
                         connection.recv_bytes(MAX_REQUEST_BYTES)
                     )
+                    request_id = request["request_id"]
                     if (
                         request["command"] == "control.shutdown"
                         and request["args"].get("token") == self._shutdown_token
@@ -282,7 +289,6 @@ class ControlServer:
                         encode_message(response, maximum=MAX_RESPONSE_BYTES)
                     )
                 except ControlError as error:
-                    request_id = locals().get("request", {}).get("request_id", "")
                     try:
                         connection.send_bytes(
                             encode_message(
@@ -296,7 +302,6 @@ class ControlServer:
                     pass
                 except Exception:
                     self.logger.exception("control_request_failed")
-                    request_id = locals().get("request", {}).get("request_id", "")
                     try:
                         connection.send_bytes(
                             encode_message(

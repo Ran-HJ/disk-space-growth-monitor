@@ -2,7 +2,7 @@
 
 这是一个面向 Windows 的磁盘空间监控工具。全功能模式通过启动和关闭目录快照定位空间变化；低内存模式只保留磁盘容量采样、趋势和历史快照查看，适合游戏等需要让出内存的场景。
 
-> 当前稳定版：v0.7.5（托盘独立设置窗口与 Windows 高 DPI 清晰度优化）。
+> 已验收稳定版：v0.8.1（深层历史、排除与查找筛选、只读迁移建议、schema v3 安全升级）。
 
 ## 当前功能
 
@@ -60,6 +60,18 @@
 - Windows 托盘显示当前模式和自动状态，可显示/隐藏窗口、切换模式、扫描、打开设置或退出
 - 从托盘打开设置时只显示独立的小型设置窗口，不再同时恢复主界面；重复打开会聚焦同一个窗口
 - GUI 使用 Windows Per-Monitor V2 DPI 感知，并让窗口尺寸、字体与表格行高跟随显示器缩放，减少高 DPI 下的模糊和裁切
+- 设置中可显式启用“分配大小与硬链接”精确扫描；默认仍使用性能稳定的逻辑大小扫描
+- 精确扫描同时区分逻辑大小、路径分配大小和硬链接去重后的唯一分配大小，不互相替换
+- 同一底层文件的多个硬链接路径均可见；唯一占用按规范化完整路径稳定归入一个代表路径，其他路径标为“同一文件的其他路径”
+- 原生文件信息覆盖不足时只显示已测量值、已确认唯一值和覆盖文件数，不把未知值显示为 0 或完整总量
+- 数据库 schema v1 升级到 v2 前使用 SQLite backup API 创建并验证一份备份；失败会回滚且不会反复生成同内容备份
+- CLI 可用 `snapshot compare NEW OLD --accounting` 按稳定文件身份比较唯一分配变化，路径别名变化不会冒充空间增长
+- `baseline`、`closing` 和带备注的 `manual_save` 快照保存完整目录汇总；程序重启后仍可逐层展开，未保存的文件明细以聚合差额显示
+- schema v3 使用跨快照路径字典；完整目录指标默认分别保留 7/30/90 天，活动会话引用不会提前清理，旧快照仍可浅层查看
+- 设置页支持逐行排除规则；绝对路径和相对 glob 会在读取文件元数据前生效，排除对象与访问错误分开统计
+- 当前结果与历史快照共用深层浏览、路径前缀/有界子串、类型、扩展名、大小、修改日期、最大文件和分页查询；GUI 默认使用更符合文件名查找习惯的有界子串，仍可显式切换路径前缀
+- 扫描配置以规范化 JSON 原文保存并直接比较；配置不一致时默认阻止增长归因，不计算额外配置哈希
+- “迁移建议”只分析已记录文件并估算显式目标盘空间，保守排除系统/应用数据、硬链接、云占位、缺失或已变化对象；不提供文件操作入口
 
 ## 直接运行
 
@@ -78,12 +90,19 @@ python run_cli.py mode set full --rescan later --json
 python run_cli.py scan start "D:\data" --json
 python run_cli.py scan wait --request-id REQUEST_ID --json
 python run_cli.py tree current --limit 20 --json
+python run_cli.py snapshot compare NEW_ID OLD_ID --accounting --json
 ```
 
 程序数据保存在：
 
 ```text
 %LOCALAPPDATA%\DiskGrowthMonitor\monitor.db
+```
+
+schema v1→v2 或 v2→v3 首次升级时，升级前备份保存在：
+
+```text
+%LOCALAPPDATA%\DiskGrowthMonitor\backups\
 ```
 
 界面故障日志保存在：
@@ -96,28 +115,33 @@ python run_cli.py tree current --limit 20 --json
 
 发布包包含两个程序：
 
-- `disk-space-growth-monitor-v0.7.5.exe`：图形界面、自动模式、托盘和控制服务。
-- `diskmonitor-cli-v0.7.5.exe`：供用户、脚本或本地 Agent 调用的命令行客户端。
+- `disk-space-growth-monitor-v0.8.1.exe`：图形界面、自动模式、托盘和控制服务。
+- `diskmonitor-cli-v0.8.1.exe`：供用户、脚本或本地 Agent 调用的命令行客户端。
 
 常用操作：
 
 ```powershell
 # 幂等启动；GUI 已运行时不会抢窗口焦点
-.\diskmonitor-cli-v0.7.5.exe app start --json
+.\diskmonitor-cli-v0.8.1.exe app start --json
 
 # 明确切换模式；低内存模式会拒绝扫描
-.\diskmonitor-cli-v0.7.5.exe mode set low_memory --json
-.\diskmonitor-cli-v0.7.5.exe mode set full --rescan now --json
+.\diskmonitor-cli-v0.8.1.exe mode set low_memory --json
+.\diskmonitor-cli-v0.8.1.exe mode set full --rescan now --json
 
 # 启动扫描后，用响应中的 request_id 等待或读取结果
-.\diskmonitor-cli-v0.7.5.exe scan start "D:\data" --json
-.\diskmonitor-cli-v0.7.5.exe scan wait --request-id REQUEST_ID --json
+.\diskmonitor-cli-v0.8.1.exe scan start "D:\data" --json
+.\diskmonitor-cli-v0.8.1.exe scan wait --request-id REQUEST_ID --json
 
 # Agent 导航和数据读取
-.\diskmonitor-cli-v0.7.5.exe view open "D:\data\logs" --scan-if-missing --json
-.\diskmonitor-cli-v0.7.5.exe growth current --limit 20 --json
-.\diskmonitor-cli-v0.7.5.exe snapshot list --limit 20 --json
-.\diskmonitor-cli-v0.7.5.exe session last --json
+.\diskmonitor-cli-v0.8.1.exe view open "D:\data\logs" --scan-if-missing --json
+.\diskmonitor-cli-v0.8.1.exe view search logs --mode substring --limit 20 --json
+.\diskmonitor-cli-v0.8.1.exe view largest --min-size 104857600 --json
+.\diskmonitor-cli-v0.8.1.exe growth current --limit 20 --json
+.\diskmonitor-cli-v0.8.1.exe snapshot list --source closing --limit 20 --json
+.\diskmonitor-cli-v0.8.1.exe snapshot search SNAPSHOT_ID logs --mode substring --json
+.\diskmonitor-cli-v0.8.1.exe snapshot compare NEW_ID OLD_ID --deep --path "C:\" --json
+.\diskmonitor-cli-v0.8.1.exe advice list --snapshot-id SNAPSHOT_ID --target "D:\" --json
+.\diskmonitor-cli-v0.8.1.exe session last --json
 ```
 
 所有响应都带协议版本、状态码、请求编号和 UTC 响应时间。CLI 的标准输出和标准错误统一使用 UTF-8，包含中文的 `--json` 响应可直接按 UTF-8 解码。扫描是异步任务；CLI 不会静默切换模式。控制接口只有白名单操作，不支持删除文件、执行任意命令或远程网络访问。认证密钥不会写入 JSON 响应或日志。
@@ -125,8 +149,8 @@ python run_cli.py tree current --limit 20 --json
 自动模式也可由 Agent 配置：
 
 ```powershell
-.\diskmonitor-cli-v0.7.5.exe automation status --json
-.\diskmonitor-cli-v0.7.5.exe automation configure `
+.\diskmonitor-cli-v0.8.1.exe automation status --json
+.\diskmonitor-cli-v0.8.1.exe automation configure `
     --enabled on `
     --processes "r5apex.exe;cs2.exe" `
     --memory-pressure on `
@@ -157,6 +181,10 @@ python run_cli.py tree current --limit 20 --json
 15. 从低内存切回全功能时，“是”会立即补扫，“否”只恢复扫描按钮，“取消”保持低内存模式。
 16. 在“设置”中启用自动低内存模式，填写要监控的游戏进程，并按需要调整内存阈值和恢复补扫策略。
 17. 托盘图标右键菜单可显示或隐藏窗口、查看自动状态、手动切换模式、重新扫描或选择退出方式；从托盘进入“设置”只显示独立设置窗口，窗口关闭按钮仍沿用原有关闭设置。
+18. 若需要查看分配大小与硬链接，在“设置”中显式启用精确扫描；该模式会明显变慢，只对保存设置后的新扫描生效。
+19. 在“设置”中可逐行填写排除规则；保存时会校验当前扫描根，默认规则为空。
+20. 点击“查找/筛选”，或在历史页单选一条快照后点击“查看/查找所选项”，可深层浏览并按路径、类型、大小、日期或最大文件查询。
+21. 点击“迁移建议”后显式选择目标盘，再刷新建议；程序只显示候选、排除原因和空间估算，请在 Windows 或原应用中自行操作。
 
 ## v0.7.0 内存目标与实测
 
@@ -179,21 +207,28 @@ python -m pip install -r requirements-build.txt
 
 `build.ps1` 是唯一打包配置源，显式关闭 UPX；PyInstaller 自动生成的
 `.spec` 属于临时产物，不纳入版本控制。生成的程序位于
-`dist/disk-space-growth-monitor-v0.7.5.exe` 和
-`dist/diskmonitor-cli-v0.7.5.exe`。GUI 构建会嵌入 Per-Monitor V2 DPI
+`dist/disk-space-growth-monitor-v0.8.1.exe` 和
+`dist/diskmonitor-cli-v0.8.1.exe`。GUI 构建会嵌入 Per-Monitor V2 DPI
 manifest；运行时也会同步 Tk 的字体缩放，以适配多显示器缩放。
+
+## 许可证
+
+本项目采用 [MIT License](LICENSE)，版权所有 © 2026 Ran-HJ。
 
 ## 已知边界
 
-- 当前统计的是文件逻辑大小，与 NTFS 实际分配空间可能存在小幅差异。
-- 硬链接可能被重复计数。
+- 默认模式统计文件逻辑大小；精确分配/硬链接统计必须在设置中显式开启，在本机 System32 固定夹具上约为 v0.7.5 逻辑扫描的 19.7 倍，不适合作为默认。
+- 精确模式遇到无权限、扫描中变化、文件系统不支持或原生元数据读取失败时会标为部分覆盖；只显示已测量/已确认值，不承诺完整物理占用。
+- 唯一分配只在本次扫描范围内按稳定文件身份去重；扫描范围外的硬链接不会被枚举，链接总数可能大于界面发现的路径数。
+- 唯一占用的代表路径只是确定性记账归属，不代表该路径是底层文件的唯一增长来源。
 - 未以管理员身份运行时，部分系统目录无法读取；程序会跳过并统计错误数。
-- 地址差异数据库仍默认覆盖两层目录和全盘最大的 200 个文件。会话内导航骨架可以秒开深层目录，但深层小文件的历史变化仍需进入相关目录后重新扫描才能建立更细快照。
-- 导航骨架只在当前程序会话中保留，重启后会按历史快照或重新扫描流程恢复。
+- 文件明细仍受默认两层和全局最大 200 个文件限制；v3 完整目录汇总可在重启后继续深层展开，但未记录的小文件只能作为目录聚合差额显示。
+- 只有基线、正常结束和带备注的手动快照保存完整目录汇总；普通手动/导航快照以及过期、旧版本快照会明确降级为浅层视图。
 - 正常关闭会等待结束扫描完成。系统强制关机时受 Windows 退出时限影响，程序会优先保存总增长量，并尽量使用最近一次已完成的地址快照。
 - 顶部累计变化使用磁盘已用容量口径；目录和文件明细使用文件逻辑大小口径，两者可能不完全一致。
 - “50 MB 骨架预算”是每次扫描保留文件明细的软预算；目录节点是秒开导航所必需，不会为了达标而删除。底部状态会另行显示包含目录节点的骨架估算值，因此大规模目录树可能超过 50 MB。
 - 文件快照、运行期间磁盘变化、未监控期间磁盘变化的起止时间和统计口径不同，只用于相互参照，不能直接相加或要求数值完全相等。
 - 低内存期间只记录磁盘已用容量，不保留实时文件地址明细；切回后的补扫只能诚实表述为“自参考快照以来”，不能证明全部文件变化都发生在低内存期间。
 - PyInstaller 单文件 EXE 正常包含启动器和窗口两个进程；内存实测的“两进程合计”已同时计入两者。
-- 程序只分析和记录，不会自动删除任何文件。
+- 迁移建议不能证明文件未被占用，目标盘空间也是读取时的即时值；身份不完整、硬链接、系统或应用管理对象默认排除。
+- 程序只分析和记录，不会自动删除、移动或修改任何用户文件。

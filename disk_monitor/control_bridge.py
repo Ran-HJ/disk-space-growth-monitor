@@ -15,6 +15,7 @@ from .control_transport import ControlServer
 class PendingControlRequest:
     request: dict[str, Any]
     completed: threading.Event = field(default_factory=threading.Event)
+    cancelled: threading.Event = field(default_factory=threading.Event)
     response: dict[str, Any] | None = None
 
 
@@ -57,6 +58,7 @@ class GuiControlBridge:
         pending = PendingControlRequest(request)
         self.requests.put(pending)
         if not pending.completed.wait(self.ui_timeout):
+            pending.cancelled.set()
             return error_response(
                 request["request_id"],
                 "timeout",
@@ -81,6 +83,9 @@ class GuiControlBridge:
                 pending = self.requests.get_nowait()
             except queue.Empty:
                 return
+            if pending.cancelled.is_set():
+                pending.completed.set()
+                continue
             try:
                 pending.response = handler(pending.request)
             except Exception:

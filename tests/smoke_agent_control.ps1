@@ -7,12 +7,12 @@ $ErrorActionPreference = "Stop"
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $guiExe = if ([string]::IsNullOrWhiteSpace($GuiExePath)) {
-    Join-Path $projectRoot "dist\disk-space-growth-monitor-v0.7.5.exe"
+    Join-Path $projectRoot "dist\disk-space-growth-monitor-v0.8.1.exe"
 } else {
     [System.IO.Path]::GetFullPath($GuiExePath)
 }
 $cliExe = if ([string]::IsNullOrWhiteSpace($CliExePath)) {
-    Join-Path $projectRoot "dist\diskmonitor-cli-v0.7.5.exe"
+    Join-Path $projectRoot "dist\diskmonitor-cli-v0.8.1.exe"
 } else {
     [System.IO.Path]::GetFullPath($CliExePath)
 }
@@ -145,6 +145,25 @@ try {
     if (-not $opened.ok -or -not $opened.data.source) {
         throw "Agent 目录导航未命中现有扫描数据。"
     }
+    $currentSearch = Invoke-CliJson `
+        -Arguments @("view", "search", "child", "--mode", "substring", "--limit", "5", "--json")
+    if (-not $currentSearch.ok -or $currentSearch.data.items.Count -lt 1) {
+        throw "v0.8.1 当前结果子串查找没有返回明细。"
+    }
+    $currentLargest = Invoke-CliJson `
+        -Arguments @("view", "largest", "--min-size", "1", "--limit", "5", "--json")
+    if (-not $currentLargest.ok -or $currentLargest.data.items.Count -lt 1) {
+        throw "v0.8.1 当前结果最大文件查询没有返回明细。"
+    }
+    $currentAdvice = Invoke-CliJson `
+        -Arguments @("advice", "list", "--target", $smokeRoot, "--limit", "5", "--json")
+    if (
+        -not $currentAdvice.ok -or
+        $currentAdvice.data.notice -notlike "*不会移动或修改文件*" -or
+        $null -ne $currentAdvice.data.action
+    ) {
+        throw "v0.8.1 当前迁移建议缺少只读边界。"
+    }
 
     $snapshot = Invoke-CliJson `
         -Arguments @("snapshot", "save", "--note", "packaged-agent-smoke", "--json")
@@ -156,8 +175,33 @@ try {
     }
     $snapshots = Invoke-CliJson `
         -Arguments @("snapshot", "list", "--limit", "20", "--database", $databasePath, "--json")
-    if (-not ($snapshots.data.snapshots | Where-Object { $_.note -eq "packaged-agent-smoke" })) {
+    $savedSnapshot = $snapshots.data.snapshots |
+        Where-Object { $_.note -eq "packaged-agent-smoke" } |
+        Select-Object -First 1
+    if (-not $savedSnapshot) {
         throw "只读快照查询未找到 Agent 保存的快照。"
+    }
+    $historySearch = Invoke-CliJson `
+        -Arguments @(
+            "snapshot", "search", [string]$savedSnapshot.id, "child.bin",
+            "--mode", "substring", "--limit", "5", "--database", $databasePath,
+            "--json"
+        )
+    if (-not $historySearch.ok -or $historySearch.data.items.Count -lt 1) {
+        throw "v0.8.1 重启可用的历史快照查找没有返回明细。"
+    }
+    $historyAdvice = Invoke-CliJson `
+        -Arguments @(
+            "advice", "list", "--snapshot-id", [string]$savedSnapshot.id,
+            "--target", $smokeRoot, "--limit", "5", "--database", $databasePath,
+            "--json"
+        )
+    if (
+        -not $historyAdvice.ok -or
+        $historyAdvice.data.notice -notlike "*不会移动或修改文件*" -or
+        $null -ne $historyAdvice.data.action
+    ) {
+        throw "v0.8.1 历史迁移建议缺少只读边界。"
     }
 
     $closed = Invoke-CliJson `
@@ -207,7 +251,7 @@ try {
     if (-not $lastSession.ok -or -not $lastSession.data.session) {
         throw "GUI 关闭后的只读会话查询失败。"
     }
-    Write-Host "双 EXE Agent 控制、认证、模式、扫描、导航、快照、重启与只读查询冒烟通过。"
+    Write-Host "双 EXE Agent 控制、扫描、深层查找、最大文件、只读迁移建议、重启与历史查询冒烟通过。"
 }
 finally {
     foreach ($processId in $knownPids) {
