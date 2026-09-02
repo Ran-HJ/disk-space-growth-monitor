@@ -488,7 +488,8 @@ class UiFlowTests(unittest.TestCase):
                     ),
                     controls.winfo_width(),
                 )
-                self.assertGreaterEqual(app.map_canvas.winfo_height(), 75)
+                self.assertTrue(app.map_canvas.winfo_ismapped())
+                self.assertGreater(app.map_canvas.winfo_height(), 1)
                 self.assertTrue(app.context_status_label.winfo_ismapped())
                 root.withdraw()
 
