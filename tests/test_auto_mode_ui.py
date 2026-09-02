@@ -156,6 +156,9 @@ class AutoModeUiTests(unittest.TestCase):
                 self.assertTrue(configured["ok"])
                 self.assertTrue(configured["data"]["config"]["enabled"])
                 self.assertEqual(storage.get_setting("auto_mode_enabled"), "1")
+                if app.automation_after_id is not None:
+                    root.after_cancel(app.automation_after_id)
+                    app.automation_after_id = None
 
                 game = AutoObservation(40, ("game.exe",), "game-start")
                 first = app._run_automation_check(game)

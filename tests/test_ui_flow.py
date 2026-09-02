@@ -477,7 +477,8 @@ class UiFlowTests(unittest.TestCase):
                 self.assertIsNotNone(app.navigation_skeleton)
 
                 root.deiconify()
-                root.geometry("900x680")
+                minimum_width, minimum_height = root.minsize()
+                root.geometry(f"{minimum_width}x{minimum_height}")
                 root.update()
                 controls = app.scan_button.master
                 self.assertLessEqual(
