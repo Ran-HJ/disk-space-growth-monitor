@@ -1,0 +1,14 @@
+required-version = "==0.16.5"
+target-version = "py310"
+extend-exclude = [
+    ".venv",
+    "build",
+    "dist",
+    "tests/results",
+]
+
+[lint]
+select = ["E4", "E7", "E9", "F"]
+
+[lint.per-file-ignores]
+"tests/benchmark_scanner.py" = ["E402"]
