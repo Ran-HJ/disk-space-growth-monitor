@@ -15,6 +15,7 @@ from typing import Any
 from . import __version__
 from .control_protocol import ControlError, error_response, success_response
 from .control_transport import ControlClient
+from .diagnostics import inspect_doctor
 from .readonly import ReadOnlyDatabase
 from .service import read_disk_sample
 from .storage import default_database_path
@@ -209,6 +210,8 @@ def build_parser() -> argparse.ArgumentParser:
     report_export.add_argument("--output", type=Path)
     report_export.add_argument("--force", action="store_true")
     report_export.add_argument("--limit", type=int, default=100)
+
+    groups.add_parser("doctor", parents=[common])
 
     return parser
 
@@ -657,6 +660,14 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
             return success_response(
                 request_id,
                 data={"format": args.format, "content": content},
+            )
+        if args.group == "doctor":
+            return success_response(
+                request_id,
+                data=inspect_doctor(
+                    database_path=args.database,
+                    control_directory=args.control_directory,
+                ),
             )
         raise ControlError("invalid_args", "未知命令")
     except ControlError as error:

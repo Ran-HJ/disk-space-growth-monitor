@@ -8,11 +8,33 @@ from unittest.mock import patch
 
 from disk_monitor.windows_file_info import (
     _extended_path,
+    file_information_api_status,
     read_file_space_info,
 )
 
 
 class WindowsFileInfoTests(unittest.TestCase):
+    def test_api_status_is_unavailable_off_windows(self) -> None:
+        with patch("disk_monitor.windows_file_info.os.name", "posix"):
+            status, detail = file_information_api_status()
+
+        self.assertEqual(status, "unavailable")
+        self.assertTrue(detail)
+
+    def test_api_status_does_not_open_a_user_file(self) -> None:
+        with (
+            patch("disk_monitor.windows_file_info.os.name", "nt"),
+            patch(
+                "disk_monitor.windows_file_info._configure_kernel32",
+                return_value=object(),
+            ) as configure,
+        ):
+            status, detail = file_information_api_status()
+
+        self.assertEqual(status, "ok")
+        self.assertTrue(detail)
+        configure.assert_called_once_with()
+
     def test_non_windows_returns_explicit_unavailable_state(self) -> None:
         with patch("disk_monitor.windows_file_info.os.name", "posix"):
             information = read_file_space_info("unused")

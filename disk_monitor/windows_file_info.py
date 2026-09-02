@@ -69,6 +69,18 @@ class FileSpaceInfo:
         return self.volume_serial_hex, self.file_id
 
 
+def file_information_api_status() -> tuple[str, str]:
+    """Report native API availability without opening or scanning a user file."""
+
+    if os.name != "nt":
+        return "unavailable", "当前系统不是 Windows"
+    try:
+        _configure_kernel32()
+    except (AttributeError, OSError):
+        return "unavailable", "Windows 文件信息 API 不可用"
+    return "ok", "支持分配大小与稳定文件 ID API"
+
+
 def _extended_path(path: str) -> str:
     absolute = os.path.abspath(path)
     if absolute.startswith("\\\\?\\"):
