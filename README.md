@@ -7,7 +7,7 @@
 
 程序只分析和记录，不会自动删除、移动、清理或修复用户文件。图形界面、SQLite 数据库和 Agent 控制接口均在本机运行，控制接口不监听网络端口。
 
-> 当前版本为 **v0.8.2，已于 2026-09-06 通过用户可视验收**。最新可下载的 GitHub Release 是 [v0.7.5](https://github.com/Ran-HJ/disk-space-growth-monitor/releases/latest)；v0.8.2 EXE 已由本地构建交付，尚未创建 GitHub Release。
+> 当前稳定版本为 **v0.8.2，已于 2026-09-06 通过用户可视验收**。从 [v0.8.2 Release](https://github.com/Ran-HJ/disk-space-growth-monitor/releases/tag/v0.8.2) 下载 Windows GUI 和 CLI。
 
 ## 核心能力
 
@@ -25,7 +25,7 @@
 
 ### 使用已发布程序
 
-从 [Releases](https://github.com/Ran-HJ/disk-space-growth-monitor/releases) 下载 GUI 程序和同版本 CLI。当前 GitHub Release 仍是 v0.7.5；v0.8.2 已验收，可从当前源码运行或构建，GitHub Release 尚未发布。
+从 [v0.8.2 Release](https://github.com/Ran-HJ/disk-space-growth-monitor/releases/tag/v0.8.2) 下载 `disk-space-growth-monitor-v0.8.2.exe` 和 `diskmonitor-cli-v0.8.2.exe`。自动化使用时请将两个程序放在同一目录；也可以从源码运行或构建。
 
 ### 从源码运行
 

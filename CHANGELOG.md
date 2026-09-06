@@ -2,9 +2,9 @@
 
 本文记录公开版本和主分支的重要变化。内部实现细节以 Git 提交为准；尚未发布的内容统一放在“未发布”。
 
-## 未发布
+## [v0.8.2] — 2026-09-06
 
-v0.8.2 已于 2026-09-06 通过用户可视验收，v0.8 系列开发与验收已完成；尚未创建 GitHub Release。
+v0.8.2 已通过用户可视验收，本次统一发布 v0.8 系列的统计正确性、深层历史与查找、只读迁移建议及以下工程改进，提供 GUI/CLI 双 EXE。
 
 ### 新增
 
@@ -65,6 +65,7 @@ v0.8.2 已于 2026-09-06 通过用户可视验收，v0.8 系列开发与验收�
 
 - 建立公开发布基线：会话快照、增长来源、Treemap、趋势、历史快照和安全取消。
 
+[v0.8.2]: https://github.com/Ran-HJ/disk-space-growth-monitor/releases/tag/v0.8.2
 [v0.7.5]: https://github.com/Ran-HJ/disk-space-growth-monitor/releases/tag/v0.7.5
 [v0.7.4]: https://github.com/Ran-HJ/disk-space-growth-monitor/releases/tag/v0.7.4
 [v0.7.3]: https://github.com/Ran-HJ/disk-space-growth-monitor/releases/tag/v0.7.3
