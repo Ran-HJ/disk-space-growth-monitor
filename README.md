@@ -7,7 +7,7 @@
 
 程序只分析和记录，不会自动删除、移动、清理或修复用户文件。图形界面、SQLite 数据库和 Agent 控制接口均在本机运行，控制接口不监听网络端口。
 
-> 当前源码为 **v0.8.2 发布候选，待用户验收**。最新可下载的 GitHub Release 是 [v0.7.5](https://github.com/Ran-HJ/disk-space-growth-monitor/releases/latest)；候选 EXE 由本地构建交付，尚未创建 v0.8.2 Release。
+> 当前版本为 **v0.8.2，已于 2026-09-06 通过用户可视验收**。最新可下载的 GitHub Release 是 [v0.7.5](https://github.com/Ran-HJ/disk-space-growth-monitor/releases/latest)；v0.8.2 EXE 已由本地构建交付，尚未创建 GitHub Release。
 
 ## 核心能力
 
@@ -25,7 +25,7 @@
 
 ### 使用已发布程序
 
-从 [Releases](https://github.com/Ran-HJ/disk-space-growth-monitor/releases) 下载 GUI 程序和同版本 CLI。当前 GitHub Release 仍是 v0.7.5；仓库中的 v0.8.x 功能将在 v0.8.2 验收完成后统一发布。
+从 [Releases](https://github.com/Ran-HJ/disk-space-growth-monitor/releases) 下载 GUI 程序和同版本 CLI。当前 GitHub Release 仍是 v0.7.5；v0.8.2 已验收，可从当前源码运行或构建，GitHub Release 尚未发布。
 
 ### 从源码运行
 
@@ -69,7 +69,7 @@ python run_cli.py doctor --json
 
 ## Agent CLI
 
-v0.8.2 候选包包含 GUI 和 CLI 两个程序。以下示例使用候选 CLI：
+v0.8.2 包含 GUI 和 CLI 两个程序。以下示例使用同版本 CLI：
 
 ```powershell
 # 幂等启动 GUI；已运行时不会抢窗口焦点
@@ -124,7 +124,7 @@ python -m pip install -r requirements-build.txt
 ./build.ps1
 ```
 
-候选构建输出：
+构建输出：
 
 - `dist/disk-space-growth-monitor-v0.8.2.exe`
 - `dist/diskmonitor-cli-v0.8.2.exe`
@@ -137,7 +137,7 @@ python -m pip install -r requirements-build.txt
 ./tests/smoke_exe.ps1 -CloseBehavior quick
 ```
 
-`smoke_doctor.ps1` 自动创建并清理临时数据库和控制端点，检查只读诊断、缺失库、外键、秘密不输出及严格 UTF-8 JSON。自动验证通过后仍需用户可视验收。
+`smoke_doctor.ps1` 自动创建并清理临时数据库和控制端点，检查只读诊断、缺失库、外键、秘密不输出及严格 UTF-8 JSON。每个后续版本在自动验证通过后仍需用户可视验收。
 
 GitHub Actions 只执行 Windows 下的测试、编译和固定版本 Ruff 检查，不读取 secrets、不使用正式数据库，也不构建发布附件。PyInstaller 发布构建仍由本地 `build.ps1` 负责。
 
