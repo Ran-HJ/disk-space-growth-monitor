@@ -7,7 +7,7 @@
 
 程序只分析和记录，不会自动删除、移动、清理或修复用户文件。图形界面、SQLite 数据库和 Agent 控制接口均在本机运行，控制接口不监听网络端口。
 
-> 当前源码版本为 **v0.8.1**，`main` 正在完成 v0.8.2 的工程化收尾。最新可下载的 GitHub Release 是 [v0.7.5](https://github.com/Ran-HJ/disk-space-growth-monitor/releases/latest)；v0.8.2 尚未进入发布候选阶段。
+> 当前源码为 **v0.8.2 发布候选，待用户验收**。最新可下载的 GitHub Release 是 [v0.7.5](https://github.com/Ran-HJ/disk-space-growth-monitor/releases/latest)；候选 EXE 由本地构建交付，尚未创建 v0.8.2 Release。
 
 ## 核心能力
 
@@ -69,24 +69,24 @@ python run_cli.py doctor --json
 
 ## Agent CLI
 
-发布包包含 GUI 和 CLI 两个程序。常用操作示例：
+v0.8.2 候选包包含 GUI 和 CLI 两个程序。以下示例使用候选 CLI：
 
 ```powershell
 # 幂等启动 GUI；已运行时不会抢窗口焦点
-.\diskmonitor-cli-v0.8.1.exe app start --json
+.\diskmonitor-cli-v0.8.2.exe app start --json
 
 # 明确切换资源模式
-.\diskmonitor-cli-v0.8.1.exe mode set low_memory --json
-.\diskmonitor-cli-v0.8.1.exe mode set full --rescan later --json
+.\diskmonitor-cli-v0.8.2.exe mode set low_memory --json
+.\diskmonitor-cli-v0.8.2.exe mode set full --rescan later --json
 
 # 启动并等待一次扫描
-.\diskmonitor-cli-v0.8.1.exe scan start "D:\data" --json
-.\diskmonitor-cli-v0.8.1.exe scan wait --request-id REQUEST_ID --json
+.\diskmonitor-cli-v0.8.2.exe scan start "D:\data" --json
+.\diskmonitor-cli-v0.8.2.exe scan wait --request-id REQUEST_ID --json
 
 # 只读历史查询
-.\diskmonitor-cli-v0.8.1.exe snapshot search SNAPSHOT_ID logs --mode substring --json
-.\diskmonitor-cli-v0.8.1.exe snapshot compare NEW_ID OLD_ID --deep --path "C:\" --json
-.\diskmonitor-cli-v0.8.1.exe advice list --snapshot-id SNAPSHOT_ID --target "D:\" --json
+.\diskmonitor-cli-v0.8.2.exe snapshot search SNAPSHOT_ID logs --mode substring --json
+.\diskmonitor-cli-v0.8.2.exe snapshot compare NEW_ID OLD_ID --deep --path "C:\" --json
+.\diskmonitor-cli-v0.8.2.exe advice list --snapshot-id SNAPSHOT_ID --target "D:\" --json
 ```
 
 所有 JSON 响应都包含协议版本、状态码、请求编号和 UTC 时间。CLI 不会静默切换模式，也不支持删除文件、执行任意命令或远程网络访问。
@@ -123,6 +123,21 @@ python -m compileall -q disk_monitor tests run.py run_cli.py
 python -m pip install -r requirements-build.txt
 ./build.ps1
 ```
+
+候选构建输出：
+
+- `dist/disk-space-growth-monitor-v0.8.2.exe`
+- `dist/diskmonitor-cli-v0.8.2.exe`
+
+在独立 PowerShell 7 中执行聚焦隔离冒烟：
+
+```powershell
+./tests/smoke_doctor.ps1
+./tests/smoke_doctor.ps1 -CliExePath ./dist/diskmonitor-cli-v0.8.2.exe
+./tests/smoke_exe.ps1 -CloseBehavior quick
+```
+
+`smoke_doctor.ps1` 自动创建并清理临时数据库和控制端点，检查只读诊断、缺失库、外键、秘密不输出及严格 UTF-8 JSON。自动验证通过后仍需用户可视验收。
 
 GitHub Actions 只执行 Windows 下的测试、编译和固定版本 Ruff 检查，不读取 secrets、不使用正式数据库，也不构建发布附件。PyInstaller 发布构建仍由本地 `build.ps1` 负责。
 

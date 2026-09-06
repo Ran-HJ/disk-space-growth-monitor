@@ -8,8 +8,8 @@ param(
 $ErrorActionPreference = "Stop"
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
-$defaultExePath = Join-Path $projectRoot "dist\disk-space-growth-monitor-v0.8.1.exe"
-$defaultCliExePath = Join-Path $projectRoot "dist\diskmonitor-cli-v0.8.1.exe"
+$defaultExePath = Join-Path $projectRoot "dist\disk-space-growth-monitor-v0.8.2.exe"
+$defaultCliExePath = Join-Path $projectRoot "dist\diskmonitor-cli-v0.8.2.exe"
 $exePath = if ([string]::IsNullOrWhiteSpace($ExePath)) {
     $defaultExePath
 } elseif ([System.IO.Path]::IsPathRooted($ExePath)) {

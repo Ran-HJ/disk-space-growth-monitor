@@ -4,7 +4,11 @@
 
 ## 未发布
 
+当前源码为 v0.8.2 发布候选，待用户验收；尚未创建 GitHub Release。
+
 ### 新增
+
+- 源码与指定打包 CLI 共用的 doctor 隔离冒烟，验证只读数据库、控制秘密不输出和 UTF-8 JSON。
 
 - 完全只读的 `doctor --json`，检查 SQLite、控制端点、日志目录和 Windows 文件信息能力。
 - Windows GitHub Actions：Python 3.10/3.13 回归、`compileall` 和固定版本 Ruff 检查。
